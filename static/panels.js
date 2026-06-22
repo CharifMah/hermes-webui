@@ -11074,6 +11074,7 @@ function updateNotificationPermissionStatus(){
       btn.setAttribute('aria-disabled','true');
     }
     if(btnWrap) btnWrap.title=unsupported;
+    if(typeof refreshWebPushUi==='function') void refreshWebPushUi();
     return;
   }
   const perm=Notification.permission||'default';
@@ -11087,4 +11088,5 @@ function updateNotificationPermissionStatus(){
     btn.setAttribute('aria-disabled', granted?'true':'false');
   }
   if(btnWrap) btnWrap.title=label;
+  if(typeof refreshWebPushUi==='function') void refreshWebPushUi();
 }

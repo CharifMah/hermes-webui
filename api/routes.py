@@ -9749,6 +9749,19 @@ def _render_index_shell_base() -> str:
     return base
 
 
+def _request_csrf_token(handler) -> str:
+    try:
+        from api.auth import csrf_token_for_session, is_auth_enabled, parse_cookie, verify_session
+
+        if is_auth_enabled():
+            cookie_val = parse_cookie(handler)
+            if cookie_val and verify_session(cookie_val):
+                return csrf_token_for_session(cookie_val) or ""
+    except Exception:
+        pass
+    return ""
+
+
 def handle_get(handler, parsed) -> bool:
     """Handle all GET routes. Returns True if handled, False for 404."""
 
@@ -9772,22 +9785,11 @@ def handle_get(handler, parsed) -> bool:
         try:
             from api.extensions import inject_extension_tags
 
-            csrf_token = ""
-            try:
-                from api.auth import csrf_token_for_session, is_auth_enabled, parse_cookie, verify_session
-
-                if is_auth_enabled():
-                    cookie_val = parse_cookie(handler)
-                    if cookie_val and verify_session(cookie_val):
-                        csrf_token = csrf_token_for_session(cookie_val) or ""
-            except Exception:
-                csrf_token = ""
-
             # The disk read + process-constant token substitutions are cached;
             # only the per-session CSRF token and per-request extension tags are
             # applied here (see _render_index_shell_base).
             html = _render_index_shell_base().replace(
-                "__CSRF_TOKEN_JSON__", json.dumps(csrf_token)
+                "__CSRF_TOKEN_JSON__", json.dumps(_request_csrf_token(handler))
             )
             return t(
                 handler,
@@ -9862,6 +9864,8 @@ def handle_get(handler, parsed) -> bool:
             version_token = quote(WEBUI_VERSION, safe="")
             text = sw_path.read_text(encoding="utf-8").replace(
                 "__WEBUI_VERSION__", version_token
+            ).replace(
+                "__CSRF_TOKEN_JSON__", json.dumps(_request_csrf_token(handler))
             )
             data = text.encode("utf-8")
             handler.send_response(200)
@@ -10131,6 +10135,12 @@ def handle_get(handler, parsed) -> bool:
         except Exception:
             pass
         return j(handler, settings)
+
+    if parsed.path == "/api/push/status":
+        return _handle_push_status(handler)
+
+    if parsed.path == "/api/push/vapid-public-key":
+        return _handle_push_vapid_public_key(handler)
 
     if parsed.path == "/api/transcribe/capability":
         return handle_transcribe_capability(handler)
@@ -12747,6 +12757,9 @@ def handle_post(handler, parsed) -> bool:
         except RuntimeError as e:
             return bad(handler, str(e), 409)
 
+    if parsed.path == "/api/push/subscribe":
+        return _handle_push_subscribe(handler, body)
+
     # ── Settings (POST) ──
     if parsed.path == "/api/settings":
         from api.auth import (
@@ -13649,6 +13662,9 @@ def handle_delete(handler, parsed) -> bool:
         prompts = [p for p in _load_saved_prompts() if p.get("id") != pid]
         _save_saved_prompts(prompts)
         return j(handler, {"ok": True})
+
+    if parsed.path == "/api/push/subscribe":
+        return _handle_push_unsubscribe(handler, body)
 
     if parsed.path.startswith("/api/kanban/"):
         from api.kanban_bridge import handle_kanban_delete
@@ -16598,6 +16614,51 @@ def _handle_cron_recent(handler, parsed):
         return j(handler, {"completions": completions, "since": since})
     except ImportError:
         return j(handler, {"completions": [], "since": since})
+
+
+def _handle_push_status(handler):
+    from api.web_push import web_push_status
+
+    return j(handler, web_push_status())
+
+
+def _handle_push_vapid_public_key(handler):
+    from api.config import web_push_public_key
+    from api.web_push import web_push_status
+
+    status = web_push_status()
+    if not status.get("enabled"):
+        return bad(handler, "Web Push is not configured", 404)
+    return j(handler, {"public_key": web_push_public_key()})
+
+
+def _handle_push_subscribe(handler, body):
+    from api.web_push import upsert_subscription, web_push_status
+
+    if not web_push_status().get("enabled"):
+        return bad(handler, "Web Push is not configured", 409)
+    subscription = body.get("subscription") if isinstance(body, dict) else None
+    if not isinstance(subscription, dict):
+        subscription = body if isinstance(body, dict) else {}
+    try:
+        saved = upsert_subscription(subscription)
+    except ValueError as exc:
+        return bad(handler, str(exc), 400)
+    return j(handler, {"ok": True, "subscription": saved})
+
+
+def _handle_push_unsubscribe(handler, body):
+    from api.web_push import remove_subscription
+
+    endpoint = ""
+    if isinstance(body, dict):
+        endpoint = str(body.get("endpoint") or "").strip()
+        if not endpoint and isinstance(body.get("subscription"), dict):
+            endpoint = str(body["subscription"].get("endpoint") or "").strip()
+    if not endpoint:
+        return bad(handler, "subscription endpoint is required", 400)
+    removed = remove_subscription(endpoint)
+    return j(handler, {"ok": True, "removed": removed})
 
 
 _PROJECT_CONTEXT_HERMES_NAMES = (".hermes.md", "HERMES.md")

@@ -8,6 +8,7 @@
 // Cache version is injected by the server at request time (routes.py /sw.js handler).
 // Bumps automatically whenever the git commit changes — no manual edits needed.
 const CACHE_NAME = 'hermes-shell-__WEBUI_VERSION__';
+const WEB_PUSH_CSRF_TOKEN = __CSRF_TOKEN_JSON__;
 
 // Static assets that form the app shell.
 //
@@ -171,6 +172,100 @@ self.addEventListener('fetch', (event) => {
       headers: { 'Content-Type': 'text/plain; charset=utf-8' },
     })))
   );
+});
+
+function _webPushScopeUrl(path) {
+  const rel = String(path || '').replace(/^\/+/, '');
+  return new URL(rel, self.registration.scope || './').href;
+}
+
+async function _webPushFetchJson(path, options = {}) {
+  const headers = {'Content-Type': 'application/json', ...(options.headers || {})};
+  if (WEB_PUSH_CSRF_TOKEN) headers['X-Hermes-CSRF-Token'] = WEB_PUSH_CSRF_TOKEN;
+  const response = await fetch(_webPushScopeUrl(path), {
+    credentials: 'same-origin',
+    headers,
+    ...options,
+  });
+  if (!response.ok) throw new Error(`Web Push route failed: ${response.status}`);
+  const text = await response.text();
+  return text ? JSON.parse(text) : {};
+}
+
+function _webPushUrlBase64ToUint8Array(base64String) {
+  const normalized = String(base64String || '').replace(/-/g, '+').replace(/_/g, '/');
+  const padding = '='.repeat((4 - normalized.length % 4) % 4);
+  const raw = atob(normalized + padding);
+  return Uint8Array.from(raw, (ch) => ch.charCodeAt(0));
+}
+
+function _normalizePushNotificationPayload(payload) {
+  const normalized = payload && typeof payload === 'object' ? payload : {};
+  const options = normalized.options && typeof normalized.options === 'object'
+    ? { ...normalized.options }
+    : {};
+  if (!options.icon) options.icon = 'static/favicon-192.png';
+  if (!options.badge) options.badge = 'static/favicon-32.png';
+  if (!options.data || typeof options.data !== 'object') options.data = {};
+  if (!options.data.url) options.data.url = './';
+  return {
+    title: normalized.title || 'Hermes',
+    options,
+  };
+}
+
+self.addEventListener('push', (event) => {
+  const payload = (() => {
+    if (!(event && event.data)) return _normalizePushNotificationPayload({});
+    try {
+      return _normalizePushNotificationPayload(event.data.json());
+    } catch (_jsonErr) {
+      return _normalizePushNotificationPayload({
+        title: 'Hermes',
+        options: { body: event.data.text() || '' },
+      });
+    }
+  })();
+  event.waitUntil(self.registration.showNotification(payload.title, payload.options));
+});
+
+self.addEventListener('pushsubscriptionchange', (event) => {
+  event.waitUntil((async () => {
+    try {
+      const status = await _webPushFetchJson('/api/push/status');
+      const oldEndpoint = event.oldSubscription && event.oldSubscription.endpoint;
+      if (!status || !status.enabled) {
+        if (oldEndpoint) {
+          await _webPushFetchJson('/api/push/subscribe', {
+            method: 'DELETE',
+            body: JSON.stringify({ endpoint: oldEndpoint }),
+          }).catch(() => {});
+        }
+        return;
+      }
+      let subscription = event.newSubscription || null;
+      if (!subscription) {
+        const keyData = await _webPushFetchJson('/api/push/vapid-public-key');
+        subscription = await self.registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: _webPushUrlBase64ToUint8Array(keyData.public_key || ''),
+        });
+      }
+      const payload = subscription && subscription.toJSON
+        ? subscription.toJSON()
+        : JSON.parse(JSON.stringify(subscription || {}));
+      await _webPushFetchJson('/api/push/subscribe', {
+        method: 'POST',
+        body: JSON.stringify({ subscription: payload }),
+      });
+      if (oldEndpoint && payload.endpoint && oldEndpoint !== payload.endpoint) {
+        await _webPushFetchJson('/api/push/subscribe', {
+          method: 'DELETE',
+          body: JSON.stringify({ endpoint: oldEndpoint }),
+        }).catch(() => {});
+      }
+    } catch (_err) {}
+  })());
 });
 
 

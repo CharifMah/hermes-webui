@@ -258,9 +258,11 @@ globalThis.newSession = async (flash, options) => {
 globalThis.showToast = (message) => {
   params.toasts.push(String(message || ''));
 };
-globalThis._newSessionInFlight = params.newSessionInFlight
-  ? Promise.resolve(params.newSessionInFlight)
-  : null;
+globalThis._newSessionInFlight = params.newSessionInFlightReject
+  ? Promise.reject(new Error(params.newSessionInFlightReject))
+  : (params.newSessionInFlight
+      ? Promise.resolve(params.newSessionInFlight)
+      : null);
 
 eval(extractFunction(sessionsSrc, '_attachProjectQuickCreateButton'));
 
@@ -314,6 +316,7 @@ def _run_quick_create_case(
     active_project="active-project",
     fail_new_session=False,
     new_session_inflight=None,
+    new_session_inflight_reject=None,
 ):
     payload = {
         "projectId": project_id,
@@ -328,6 +331,7 @@ def _run_quick_create_case(
         "touchStopImmediateCount": 0,
         "failNewSession": fail_new_session,
         "newSessionInFlight": new_session_inflight,
+        "newSessionInFlightReject": new_session_inflight_reject,
         "toasts": [],
     }
     result = subprocess.run(
@@ -387,3 +391,16 @@ def test_project_chip_quick_create_leaves_filter_unchanged_during_inflight_guard
     assert out["filterProjectId"] == "keep-me"
     assert {"type": "set-filter", "projectId": "project-123"} not in out["calls"]
     assert "newSession" not in out
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_project_chip_quick_create_swallows_duplicate_inflight_rejections():
+    out = _run_quick_create_case(
+        "project-123",
+        active_project="keep-me",
+        new_session_inflight_reject="request failed",
+    )
+
+    assert out["filterProjectId"] == "keep-me"
+    assert {"type": "set-filter", "projectId": "project-123"} not in out["calls"]
+    assert out["toasts"] == ["New conversation already in progress"]

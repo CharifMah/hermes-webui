@@ -6169,7 +6169,11 @@ function _attachProjectQuickCreateButton(chip, project){
     stop(e);
     if(_newSessionInFlight){
       // The initiating tap already owns the filter change and rollback path.
-      await newSession(false,{project_id:project.project_id});
+      try{
+        await newSession(false,{project_id:project.project_id});
+      }catch(_){
+        // The initiating tap already owns the visible failure path.
+      }
       return;
     }
     const previousProject=(typeof _activeProject!=='undefined')?_activeProject:NO_PROJECT_FILTER;

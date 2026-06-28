@@ -278,7 +278,7 @@ def test_dispatch_502_when_no_frame_matches_request_id():
     try:
         h = _H()
         with patch.object(pm, "get_plugin_process", return_value=proc):
-            result = _dispatch_plugin_subprocess(
+            _dispatch_plugin_subprocess(
                 h, "nomatch", "/r", "GET", SimpleNamespace(path="", query=""),
             )
         t.join(timeout=5)

@@ -8,6 +8,7 @@ import subprocess
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
+import pytest
 from docx import Document as DocxDocument
 from openpyxl import Workbook
 
@@ -49,8 +50,19 @@ def _extract_workspace_function(name: str) -> str:
     marker = f"async function {name}("
     start = WORKSPACE_JS.find(marker)
     assert start >= 0, f"{name} not found in static/workspace.js"
+    params_depth = 0
+    body_start = -1
+    for idx in range(start, len(WORKSPACE_JS)):
+        char = WORKSPACE_JS[idx]
+        if char == "(":
+            params_depth += 1
+        elif char == ")":
+            params_depth -= 1
+        elif char == "{" and params_depth == 0:
+            body_start = idx
+            break
+    assert body_start >= 0, f"could not find function body for {name}"
     depth = 0
-    body_start = WORKSPACE_JS.find("{", start)
     for idx in range(body_start, len(WORKSPACE_JS)):
         char = WORKSPACE_JS[idx]
         if char == "{":

@@ -15,7 +15,7 @@ OFFICE_RENDER_MODE = "code"
 
 _DOCX_BODY_CHILDREN = {qn("w:p"), qn("w:sectPr")}
 _DOCX_PARAGRAPH_CHILDREN = {qn("w:r")}
-_DOCX_RUN_CHILDREN = {qn("w:rPr"), qn("w:t")}
+_DOCX_RUN_CHILDREN = {qn("w:t")}
 
 
 def is_claimed_office_path(path: str | Path) -> bool:

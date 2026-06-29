@@ -533,12 +533,13 @@ def _redact_config_for_display(value, *, path: tuple[str, ...] = ()):
     see tests/test_safe_config_viewer.py for the non-vacuous regression.
 
     Non-secret strings are scrubbed UNCONDITIONALLY for inline credentials
-    (``_scrub_config_scalar_secrets`` — URL userinfo + sensitive query params,
-    #5088) and then run through the existing value-level redactor
-    (``_redact_text``) for accidentally-pasted tokens. The inline scrub does NOT
-    respect ``api_redact_enabled`` (the safe-config viewer must never leak a
-    credential, even when an operator disabled response redaction); the
-    path-based ``[REDACTED]`` above is likewise unconditional.
+    (``_scrub_config_scalar_secrets`` — URL userinfo + sensitive query/fragment
+    params + known capability-URL path tokens, #5088) and then run through the
+    free-text token redactor with ``_enabled=True`` so it ALWAYS runs for the
+    safe-config viewer — it never defers to the operator's ``api_redact_enabled``
+    response-redaction setting. The path-based ``[REDACTED]`` above is likewise
+    unconditional. A "safe" config view must never leak a credential, even when
+    an operator has disabled response redaction.
     """
     if isinstance(value, dict):
         return {
@@ -554,8 +555,10 @@ def _redact_config_for_display(value, *, path: tuple[str, ...] = ()):
     if value is None or isinstance(value, (bool, int, float)):
         return value
     # #5088: scrub inline URL userinfo / query-param secrets UNCONDITIONALLY,
-    # then apply the (api_redact_enabled-gated) free-text token redactor.
-    return _redact_text(_scrub_config_scalar_secrets(str(value)))
+    # then apply the free-text token redactor with _enabled=True so the
+    # safe-config viewer NEVER defers to the operator's api_redact_enabled
+    # setting (a "safe" view must redact even when response-redaction is off).
+    return _redact_text(_scrub_config_scalar_secrets(str(value)), _enabled=True)
 
 
 def _safe_config_yaml_text() -> tuple[str, int]:

@@ -1504,7 +1504,7 @@
             <div class="settings-field" style="margin-top:18px;padding-top:16px;border-top:1px solid var(--border)">
               <label data-i18n="safe_config_title">Safe config.yaml</label>
               <div style="font-size:11px;color:var(--muted);margin-bottom:8px" data-i18n="safe_config_desc">View the active profile config with secrets redacted. This panel is read-only so hidden values are never overwritten.</div>
-              <div style="font-size:11px;color:var(--muted);margin-bottom:8px" data-i18n="safe_config_redact_note">Values under credential key paths are always replaced with [REDACTED]. The extra scrub of secrets pasted into non-secret keys only runs when API redaction (api_redact_enabled) is on.</div>
+              <div style="font-size:11px;color:var(--muted);margin-bottom:8px" data-i18n="safe_config_redact_note">Values under credential key paths are always replaced with [REDACTED]. Secrets embedded in non-secret keys (URL credentials, tokens, pasted keys) are always scrubbed too, regardless of the API redaction setting.</div>
               <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
                 <button class="sm-btn" onclick="loadSafeConfig(true)" style="padding:6px 10px;font-weight:600" data-i18n="safe_config_refresh">Refresh config</button>
                 <button class="sm-btn" onclick="copySafeConfig()" style="padding:6px 10px;font-weight:600" data-i18n="safe_config_copy">Copy redacted YAML</button>

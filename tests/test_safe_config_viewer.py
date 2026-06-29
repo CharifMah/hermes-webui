@@ -91,7 +91,7 @@ def test_redact_config_masks_secret_key_paths_and_prefilters_plain_strings(monke
     monkeypatch.setattr(
         routes,
         "_redact_text",
-        lambda text: calls.append(text) or text.replace("ghp_sensitive", "[REDACTED]"),
+        lambda text, *, _enabled=None: calls.append(text) or text.replace("ghp_sensitive", "[REDACTED]"),
     )
 
     safe: dict[str, Any] = routes._redact_config_for_display({
@@ -294,9 +294,14 @@ def test_system_settings_mounts_read_only_safe_config_viewer():
 
 
 def test_redaction_disabled_doc_note_present_fix3():
-    """Maintainer fix #3: the panel documents the api_redact_enabled caveat."""
+    """The panel documents the redaction contract. As of #5088 the safe-config
+    scrub is ALWAYS on (no longer gated by api_redact_enabled), so the note must
+    state that secrets in non-secret keys are always scrubbed — and must NOT
+    claim dependence on api_redact_enabled."""
     assert 'data-i18n="safe_config_redact_note"' in INDEX_HTML
-    assert "api_redact_enabled" in INDEX_HTML
+    assert "always scrubbed" in INDEX_HTML
+    # the old caveat (scrub only when api_redact_enabled is on) must be gone
+    assert "only runs when API redaction" not in INDEX_HTML
 
 
 def test_safe_config_frontend_loads_and_copies_redacted_yaml():
@@ -408,7 +413,7 @@ def test_capability_url_path_segment_tokens_are_scrubbed(monkeypatch):
     Mask those known shapes UNCONDITIONALLY (even with _redact_text disabled);
     benign paths must be preserved (no blanket path masking)."""
     # neutralize the setting-gated redactor so we prove the UNCONDITIONAL scrub
-    monkeypatch.setattr(routes, "_redact_text", lambda t: t)
+    monkeypatch.setattr(routes, "_redact_text", lambda t, *, _enabled=None: t)
     safe = routes._redact_config_for_display({
         "slack": "https://hooks.slack.com/services/T000/B000/PATHSECRETXYZ",
         "discord": "https://discord.com/api/webhooks/123456789/DISCORDTOKENABC",
@@ -430,7 +435,7 @@ def test_url_userinfo_all_forms_scrubbed(monkeypatch):
     """#5088 round 4 (Codex re-gate): the userinfo scrubber must cover empty-
     username DSNs (redis://:PW@) and token-as-username URLs (https://TOKEN@),
     not only user:pass@. Proven with _redact_text disabled (unconditional)."""
-    monkeypatch.setattr(routes, "_redact_text", lambda t: t)
+    monkeypatch.setattr(routes, "_redact_text", lambda t, *, _enabled=None: t)
     safe = routes._redact_config_for_display({
         "redis_url": "redis://:REDIS_PW_LEAK@localhost:6379/0",
         "git_url": "https://ghp_TOKENLEAK5088@github.com/org/repo.git",
@@ -447,3 +452,19 @@ def test_url_userinfo_all_forms_scrubbed(monkeypatch):
     # benign (no userinfo) untouched
     assert safe["benign"] == "https://api.example.com/v1/users/42"
     assert safe["mailto"] == "mailto:someone@example.com"
+
+
+def test_freetext_token_scrubbed_even_when_api_redaction_disabled(monkeypatch):
+    """#5088 round 4 (root): a pasted token under a NON-sensitive key must be
+    redacted by the safe-config viewer even when api_redact_enabled is OFF —
+    the viewer forces _redact_text(_enabled=True), never deferring to the
+    operator's response-redaction setting."""
+    # Simulate api_redact_enabled = False at the settings layer.
+    monkeypatch.setattr(
+        "api.config.load_settings",
+        lambda: {"api_redact_enabled": False},
+    )
+    safe = routes._redact_config_for_display({
+        "notes": "operator pasted sk-live-PASTEDLEAK5088 here",
+    })
+    assert "PASTEDLEAK5088" not in json.dumps(safe)

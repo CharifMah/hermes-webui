@@ -400,3 +400,27 @@ def test_fragment_and_extended_param_credentials_are_scrubbed():
     # benign params with credential-substring names must NOT be over-masked
     assert "page=2" in safe["benign"] and "view=full" in safe["benign"] and "#section" in safe["benign"]
     assert "api_version=3" in safe["benign2"] and "key_count=5" in safe["benign2"]
+
+
+def test_capability_url_path_segment_tokens_are_scrubbed(monkeypatch):
+    """#5088 round 3 (Codex re-gate): provider webhook URLs embed the secret in
+    the PATH (Slack /services/.., Discord /api/webhooks/..), not userinfo/query.
+    Mask those known shapes UNCONDITIONALLY (even with _redact_text disabled);
+    benign paths must be preserved (no blanket path masking)."""
+    # neutralize the setting-gated redactor so we prove the UNCONDITIONAL scrub
+    monkeypatch.setattr(routes, "_redact_text", lambda t: t)
+    safe = routes._redact_config_for_display({
+        "slack": "https://hooks.slack.com/services/T000/B000/PATHSECRETXYZ",
+        "discord": "https://discord.com/api/webhooks/123456789/DISCORDTOKENABC",
+        "discordapp": "https://discordapp.com/api/webhooks/999/DAPPTOKEN",
+        "benign_path": "https://example.com/docs/getting-started/intro",
+        "benign_api": "https://api.example.com/v1/users/42/profile",
+    })
+    blob = json.dumps(safe)
+    for leak in ("PATHSECRETXYZ", "DISCORDTOKENABC", "DAPPTOKEN"):
+        assert leak not in blob, f"{leak} leaked"
+    # provider/structure preserved, secret segment masked
+    assert safe["slack"] == "https://hooks.slack.com/services/T000/B000/***"
+    # benign paths untouched
+    assert safe["benign_path"] == "https://example.com/docs/getting-started/intro"
+    assert safe["benign_api"] == "https://api.example.com/v1/users/42/profile"

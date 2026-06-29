@@ -483,6 +483,22 @@ def _scrub_config_scalar_secrets(text: str) -> str:
             r"\1***",
             text,
         )
+    # 4) Capability-URL PATH-segment tokens (#5088 round 3). Some providers embed
+    #    the secret in the URL PATH, not userinfo/query — masking every path
+    #    segment would destroy benign URLs, so target only KNOWN webhook shapes:
+    #      Slack:   https://hooks.slack.com/services/T../B../<SECRET>
+    #      Discord: https://(discord|discordapp).com/api/webhooks/<id>/<SECRET>
+    #    Mask the trailing secret segment(s) after the recognized prefix.
+    text = re.sub(
+        r"(?i)(https?://hooks\.slack\.com/services/[^/\s]+/[^/\s]+/)[^/\s?#]+",
+        r"\1***",
+        text,
+    )
+    text = re.sub(
+        r"(?i)(https?://(?:[a-z0-9.\-]+\.)?discord(?:app)?\.com/api/webhooks/[^/\s]+/)[^/\s?#]+",
+        r"\1***",
+        text,
+    )
     return text
 
 

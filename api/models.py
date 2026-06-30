@@ -6483,23 +6483,24 @@ def reconciled_state_db_messages_for_session(
                 # another non-prefix transform.
                 local_messages = sidecar_messages
                 using_context_messages = False
-            compressed_context = _context_messages_include_compression_marker(local_messages)
-            anchor_key = getattr(session, "compression_anchor_message_key", None)
-            if compressed_context:
-                if not anchor_key:
-                    logger.debug(
-                        "Compressed context for session %s has no compression anchor; using context_messages only",
-                        getattr(session, "session_id", None),
-                    )
-                    return list(local_messages)
-                anchor_index = _state_db_anchor_index(state_messages, anchor_key)
-                if anchor_index is None:
-                    logger.debug(
-                        "Compressed context for session %s has an unverifiable compression anchor; using context_messages only",
-                        getattr(session, "session_id", None),
-                    )
-                    return list(local_messages)
-                state_messages = list(state_messages or [])[anchor_index + 1 :]
+            if using_context_messages:
+                compressed_context = _context_messages_include_compression_marker(local_messages)
+                anchor_key = getattr(session, "compression_anchor_message_key", None)
+                if compressed_context:
+                    if not anchor_key:
+                        logger.debug(
+                            "Compressed context for session %s has no compression anchor; using context_messages only",
+                            getattr(session, "session_id", None),
+                        )
+                        return list(local_messages)
+                    anchor_index = _state_db_anchor_index(state_messages, anchor_key)
+                    if anchor_index is None:
+                        logger.debug(
+                            "Compressed context for session %s has an unverifiable compression anchor; using context_messages only",
+                            getattr(session, "session_id", None),
+                        )
+                        return list(local_messages)
+                    state_messages = list(state_messages or [])[anchor_index + 1 :]
         state_messages = state_db_delta_after_context(local_messages, state_messages)
     return merge_session_messages_append_only(
         local_messages,

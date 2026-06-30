@@ -4418,7 +4418,7 @@ def _handle_session_anchor_scene(handler, body):
     return j(handler, {"ok": True, "message_index": idx, "message_ref": ref})
 
 
-def _get_or_materialize_session(sid: str):
+def _get_or_materialize_session(sid: str, *, refresh_cli_messages: bool = False):
     """Get a session, materializing from CLI/agent metadata if not in WebUI store.
 
     Mirrors the fallback logic in /api/session/archive (routes.py:~8530).
@@ -4437,7 +4437,7 @@ def _get_or_materialize_session(sid: str):
         # below (and the heuristic record-check would mis-trip on mock sessions).
         if getattr(s, "read_only", False):
             raise PermissionError("read-only imported session")
-        if getattr(s, "is_cli_session", False):
+        if refresh_cli_messages and getattr(s, "is_cli_session", False):
             latest_messages = get_cli_session_messages(
                 sid,
                 profile=getattr(s, "profile", None),
@@ -12118,7 +12118,7 @@ def handle_post(handler, parsed) -> bool:
         except ValueError as e:
             return bad(handler, str(e))
         try:
-            s = _get_or_materialize_session(body["session_id"])
+            s = _get_or_materialize_session(body["session_id"], refresh_cli_messages=True)
         except KeyError:
             return bad(handler, "Session not found", 404)
         except PermissionError:

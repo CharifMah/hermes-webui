@@ -229,7 +229,7 @@ def test_already_claimed_cli_sidecar_still_sees_cli_prior_assistant_on_first_web
     stale_sidecar.save(touch_updated_at=False)
     models.SESSIONS[sid] = stale_sidecar
 
-    session = routes._get_or_materialize_session(sid)
+    session = routes._get_or_materialize_session(sid, refresh_cli_messages=True)
     history = _capture_streaming_history(
         monkeypatch,
         config,

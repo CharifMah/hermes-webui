@@ -35,6 +35,7 @@ from urllib.parse import urlparse
 _REPO = Path(__file__).resolve().parent.parent
 _OUTLINE_JS = _REPO / "static" / "outline.js"
 _SESSIONS_JS = _REPO / "static" / "sessions.js"
+_UI_JS = _REPO / "static" / "ui.js"
 
 
 # --------------------------------------------------------------------------- #
@@ -193,9 +194,14 @@ def test_full_session_jump_translates_full_to_local_and_forceloads():
     assert "_oldestIdx" in body and "fullIdx - off" in body, (
         "_jumpToFullSessionMessage must translate full-session index to local via _oldestIdx"
     )
-    # (b) truncated sessions force-load full history (msg_limit=9999) before resolving
+    # (b) truncated sessions force-load FULL history before resolving — via the
+    # uncapped _ensureAllMessagesLoaded() (NOT a msg_limit=9999 tail window, which
+    # misses a near-start match in a >9999-row session). #5106 round 4.
     assert "_messagesTruncated" in body
-    assert "msg_limit=9999" in body
+    assert "_ensureAllMessagesLoaded" in body
+    # the actual force-load must NOT be a msg_limit=9999 fetch (a tail window);
+    # only an explanatory comment may mention the term.
+    assert "msg_limit=9999')" not in body and "msg_limit=9999&" not in body
     # and it must NOT resolve a raw full index directly as a DOM id
     assert "'msg-user-' + fullIdx" not in body, (
         "must resolve the LOCAL index, never the raw full-session index, as the DOM id"
@@ -234,7 +240,7 @@ def test_full_session_jump_delegates_to_virtualization_aware_jump():
     assert "window.jumpToTurnQuestion" in body, (
         "_jumpToFullSessionMessage must delegate to the virtualization-aware jumpToTurnQuestion"
     )
-    ui = _UI_JS.read_text() if (globals().get("_UI_JS")) else (_REPO / "static" / "ui.js").read_text()
+    ui = _UI_JS.read_text()
     assert "window.jumpToTurnQuestion=jumpToTurnQuestion" in ui, (
         "ui.js must expose jumpToTurnQuestion on window for the cross-script content-search jump"
     )

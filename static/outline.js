@@ -175,15 +175,17 @@ function _jumpToFullSessionMessage(fullIdx, targetSid) {
   // If the session isn't truncated, local == full and the row is already present.
   if (!truncated) { _resolveAndFlash(); return; }
 
-  if (typeof api !== 'function' || S.busy || S.activeStreamId) { _resolveAndFlash(); return; }
-  api('/api/session?session_id=' + encodeURIComponent(sid) +
-      '&messages=1&resolve_model=0&msg_limit=9999')
-    .then(function(data) {
-      if (!data || !data.session) return;
+  if (S.busy || S.activeStreamId) { _resolveAndFlash(); return; }
+  // Use the existing FULL-history loader (#5106 round 4): msg_limit=9999 is still a
+  // TAIL window, so for a session with >9999 renderable rows a match near the start
+  // stays out of the window (_oldestIdx > 0, localIdx goes negative -> no jump).
+  // _ensureAllMessagesLoaded() does a true uncapped load and sets _oldestIdx=0 /
+  // _messagesTruncated=false (so local == full), with its own session-switch +
+  // prefetch-race guards.
+  if (typeof _ensureAllMessagesLoaded !== 'function') { _resolveAndFlash(); return; }
+  _ensureAllMessagesLoaded()
+    .then(function() {
       if (!S.session || S.session.session_id !== sid) return;  // session switched
-      S.messages = data.session.messages || [];
-      if (typeof _oldestIdx !== 'undefined') _oldestIdx = data.session._messages_offset || 0;
-      if (typeof _messagesTruncated !== 'undefined') _messagesTruncated = !!data.session._messages_truncated;
       _expandOutlineRenderWindow();
       if (typeof renderMessages === 'function') renderMessages({ preserveScroll: true });
       window.setTimeout(function() {

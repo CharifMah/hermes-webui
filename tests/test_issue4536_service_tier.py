@@ -29,6 +29,7 @@ class TestIssue4536ServiceTier:
 
         def _reset():
             with config._cfg_lock:
+                config._cfg_cache.clear()
                 config.cfg = config._cfg_cache
                 config._cfg_fingerprint = None
                 config._cfg_mtime = 0.0

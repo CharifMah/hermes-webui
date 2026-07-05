@@ -49,15 +49,18 @@ def _with_config(model=None, providers=None):
     except Exception:
         config._cfg_mtime = 0.0
     config._cfg_path = config._get_config_path()
-    _restore_config._old_path = old_path
-    return old_cfg, old_mtime
+    return old_cfg, (old_mtime, old_path)
 
 
 def _restore_config(old_cfg, old_mtime):
+    if isinstance(old_mtime, tuple):
+        old_mtime, old_path = old_mtime
+    else:
+        old_path = getattr(config, "_cfg_path", None)
     config.cfg.clear()
     config.cfg.update(old_cfg)
     config._cfg_mtime = old_mtime
-    config._cfg_path = getattr(_restore_config, "_old_path", None)
+    config._cfg_path = old_path
 
 
 def test_openrouter_quota_fetches_key_endpoint_and_sanitizes_response(monkeypatch, tmp_path):

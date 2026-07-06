@@ -1568,8 +1568,8 @@ def test_sidebar_lineage_segment_badge_is_detailed_density_only_and_localized():
     assert "const density=(window._sidebarDensity==='detailed'?'detailed':'compact');" in js
     assert "const showLineageMetadata=density==='detailed';" in js
     assert "const segmentCount=showLineageMetadata?_sessionSegmentCount(s):0;" in js
-    assert "const lineageSegments=showLineageMetadata?_lineageSegmentsForRender(s,lineageKey):[];" in js
     assert "const needsLineageReport=showLineageMetadata?_lineageReportNeedsFetch(s,lineageKey,segmentCount):false;" in js
+    assert "const lineageSegments=showLineageMetadata?_lineageSegmentsForRender(s,lineageKey,needsLineageReport):[];" in js
     assert "const canExpandLineageSegments=showLineageMetadata&&Boolean(" in js
     assert "t('session_meta_segments', segmentCount)" in js
     assert "titleRow.appendChild(segmentCountEl);" in js
@@ -1692,6 +1692,52 @@ console.log(JSON.stringify({{
         "tipChangedNeedsFetch": True,
         "mismatchNeedsFetch": True,
         "newCacheRetained": False,
+    }
+
+
+def test_render_path_skips_stale_cached_segments_when_mismatch_forces_refresh():
+    js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
+    source = f"""
+const src = {js!r};
+function extractFunc(name) {{
+  const re = new RegExp('function\\\\s+' + name + '\\\\s*\\\\(');
+  const start = src.search(re);
+  if (start < 0) throw new Error(name + ' not found');
+  let i = src.indexOf('{{', start);
+  let depth = 1; i++;
+  while (depth > 0 && i < src.length) {{
+    if (src[i] === '{{') depth++;
+    else if (src[i] === '}}') depth--;
+    i++;
+  }}
+  return src.slice(start, i);
+}}
+const _lineageReportCache = new Map();
+const _lineageReportInflight = new Map();
+eval(extractFunc('_sidebarLineageKeyForRow'));
+eval(extractFunc('_authoritativeLineageTipId'));
+eval(extractFunc('_lineageReportCacheKey'));
+eval(extractFunc('_lineageLocalSegmentCount'));
+eval(extractFunc('_lineageReportNeedsFetch'));
+eval(extractFunc('_lineageSegmentsForRender'));
+const row = {{
+  session_id:'tip',
+  _lineage_key:'root',
+  _lineage_tip_id:'tip',
+  _compression_segment_count:3,
+  _lineage_segments:[{{session_id:'root'}}],
+}};
+_lineageReportCache.set('root::tip', {{
+  segments:[{{session_id:'root'}}, {{session_id:'stale-extra'}}],
+}});
+const needsFetch = _lineageReportNeedsFetch(row, 'root', 3);
+const rendered = _lineageSegmentsForRender(row, 'root', needsFetch).map(seg => seg.session_id);
+console.log(JSON.stringify({{needsFetch, rendered, cacheRetained:_lineageReportCache.has('root::tip')}}));
+"""
+    assert json.loads(_run_node(source)) == {
+        "needsFetch": True,
+        "rendered": ["root"],
+        "cacheRetained": False,
     }
 
 

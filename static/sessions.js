@@ -6001,7 +6001,7 @@ function _lineageReportNeedsFetch(s,lineageKey,segmentCount){
   return Number(segmentCount||0)>_lineageLocalSegmentCount(s);
 }
 
-function _lineageSegmentsForRender(s,lineageKey){
+function _lineageSegmentsForRender(s,lineageKey,skipCached){
   const segments=[];
   const seen=new Set();
   const currentSid=s&&s.session_id;
@@ -6012,9 +6012,11 @@ function _lineageSegmentsForRender(s,lineageKey){
     segments.push({...seg});
   };
   for(const seg of (Array.isArray(s&&s._lineage_segments)?s._lineage_segments:[])) addSegment(seg);
-  const cached=_lineageReportCache.get(_lineageReportCacheKey(s,lineageKey));
-  if(cached&&Array.isArray(cached.segments)){
-    for(const seg of cached.segments) addSegment(seg);
+  if(!skipCached){
+    const cached=_lineageReportCache.get(_lineageReportCacheKey(s,lineageKey));
+    if(cached&&Array.isArray(cached.segments)){
+      for(const seg of cached.segments) addSegment(seg);
+    }
   }
   return segments;
 }
@@ -7279,8 +7281,8 @@ function renderSessionListFromCache(){
     const showLineageMetadata=density==='detailed';
     const lineageKey=_sidebarLineageKeyForRow(s);
     const segmentCount=showLineageMetadata?_sessionSegmentCount(s):0;
-    const lineageSegments=showLineageMetadata?_lineageSegmentsForRender(s,lineageKey):[];
     const needsLineageReport=showLineageMetadata?_lineageReportNeedsFetch(s,lineageKey,segmentCount):false;
+    const lineageSegments=showLineageMetadata?_lineageSegmentsForRender(s,lineageKey,needsLineageReport):[];
     const lineageReportKey=showLineageMetadata?_lineageReportCacheKey(s,lineageKey):null;
     const canExpandLineageSegments=showLineageMetadata&&Boolean(lineageKey&&segmentCount>1&&(lineageSegments.length>0||needsLineageReport||_lineageReportInflight.has(lineageReportKey)));
     const lineageSegmentsExpanded=canExpandLineageSegments&&_expandedLineageKeys.has(lineageKey);

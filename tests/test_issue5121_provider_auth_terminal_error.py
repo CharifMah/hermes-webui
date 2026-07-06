@@ -11,6 +11,7 @@ import pytest
 
 import api.config as config
 import api.models as models
+import api.routes as routes
 import api.streaming as streaming
 from api.models import Session
 
@@ -187,7 +188,7 @@ def _build_auth_failure_agent(*, token_text: str | None, success_text: str = "Re
     return AuthFailureAgent
 
 
-def _run_stream(monkeypatch, session, stream_id, agent_cls, *, workspace):
+def _run_stream(monkeypatch, session, stream_id, agent_cls, *, workspace, ephemeral=False):
     fake_queue = queue.Queue()
     streaming.STREAMS[stream_id] = fake_queue
     config.STREAM_PARTIAL_TEXT[stream_id] = ""
@@ -203,6 +204,7 @@ def _run_stream(monkeypatch, session, stream_id, agent_cls, *, workspace):
             model="test-model",
             workspace=workspace,
             stream_id=stream_id,
+            ephemeral=ephemeral,
         )
 
     return fake_queue
@@ -368,6 +370,191 @@ def test_auth_retry_success_does_not_append_error_turn(tmp_path, monkeypatch):
     assert not any(msg.get("_error") for msg in saved.messages)
 
 
+def test_auth_retry_streamed_answer_without_result_message_is_saved_as_final(tmp_path, monkeypatch):
+    session = _prepare_session(
+        "auth_retry_streamed_answer",
+        "stream_auth_retry_streamed_answer",
+        pending_user_message="Please retry and stream",
+    )
+
+    class AuthRetryStreamedAnswerAgent(MockAgent):
+        runs = 0
+
+        def run_conversation(self, **kwargs):
+            type(self).runs += 1
+            history = list(kwargs.get("conversation_history") or [])
+            if type(self).runs == 1:
+                return {
+                    "messages": history,
+                    "error": _auth_failure_error_payload(),
+                }
+            if self.stream_delta_callback is not None:
+                self.stream_delta_callback("Recovered streamed reply")
+            return {
+                "status": "ok",
+                "messages": history,
+                "error": "",
+            }
+
+    heal_rt = {
+        "provider": "test-provider",
+        "api_key": "fresh-key",
+        "base_url": None,
+    }
+
+    fake_queue = queue.Queue()
+    streaming.STREAMS["stream_auth_retry_streamed_answer"] = fake_queue
+    config.STREAM_PARTIAL_TEXT["stream_auth_retry_streamed_answer"] = ""
+
+    with mock.patch.object(streaming, "get_session", return_value=session), \
+         mock.patch.object(streaming, "_get_ai_agent", return_value=AuthRetryStreamedAnswerAgent), \
+         mock.patch.object(streaming, "resolve_model_provider", return_value=("test-model", "test-provider", None)), \
+         mock.patch("api.config.get_config", return_value={}), \
+         mock.patch("api.config._resolve_cli_toolsets", return_value=[]), \
+         mock.patch.object(streaming, "_attempt_credential_self_heal", return_value=heal_rt):
+        streaming._run_agent_streaming(
+            session_id=session.session_id,
+            msg_text=session.pending_user_message,
+            model="test-model",
+            workspace=str(tmp_path),
+            stream_id="stream_auth_retry_streamed_answer",
+        )
+
+    saved = Session.load("auth_retry_streamed_answer")
+    assert saved is not None
+
+    events = _queue_events(fake_queue)
+    assert any(event == "done" for event, _ in events)
+    assert not any(event == "apperror" for event, _ in events)
+    assert saved.messages[-1]["role"] == "assistant"
+    assert saved.messages[-1]["content"] == "Recovered streamed reply"
+    assert saved.context_messages[-1]["role"] == "assistant"
+    assert saved.context_messages[-1]["content"] == "Recovered streamed reply"
+    assert not any(msg.get("_error") for msg in saved.messages)
+
+
+def test_auth_retry_streamed_answer_with_explicit_error_still_errors(tmp_path, monkeypatch):
+    session = _prepare_session(
+        "auth_retry_streamed_explicit_error",
+        "stream_auth_retry_streamed_explicit_error",
+        pending_user_message="Please retry then fail explicitly",
+    )
+
+    class AuthRetryStreamedExplicitErrorAgent(MockAgent):
+        runs = 0
+
+        def run_conversation(self, **kwargs):
+            type(self).runs += 1
+            history = list(kwargs.get("conversation_history") or [])
+            if type(self).runs == 1:
+                return {
+                    "messages": history,
+                    "error": _auth_failure_error_payload(),
+                }
+            if self.stream_delta_callback is not None:
+                self.stream_delta_callback("Visible retry text before explicit error")
+            return {
+                "status": "ok",
+                "messages": history,
+                "error": "provider failed on retry",
+            }
+
+    heal_rt = {
+        "provider": "test-provider",
+        "api_key": "fresh-key",
+        "base_url": None,
+    }
+
+    fake_queue = queue.Queue()
+    streaming.STREAMS["stream_auth_retry_streamed_explicit_error"] = fake_queue
+    config.STREAM_PARTIAL_TEXT["stream_auth_retry_streamed_explicit_error"] = ""
+
+    with mock.patch.object(streaming, "get_session", return_value=session), \
+         mock.patch.object(streaming, "_get_ai_agent", return_value=AuthRetryStreamedExplicitErrorAgent), \
+         mock.patch.object(streaming, "resolve_model_provider", return_value=("test-model", "test-provider", None)), \
+         mock.patch("api.config.get_config", return_value={}), \
+         mock.patch("api.config._resolve_cli_toolsets", return_value=[]), \
+         mock.patch.object(streaming, "_attempt_credential_self_heal", return_value=heal_rt):
+        streaming._run_agent_streaming(
+            session_id=session.session_id,
+            msg_text=session.pending_user_message,
+            model="test-model",
+            workspace=str(tmp_path),
+            stream_id="stream_auth_retry_streamed_explicit_error",
+        )
+
+    saved = Session.load("auth_retry_streamed_explicit_error")
+    assert saved is not None
+
+    events = _queue_events(fake_queue)
+    apperrors = [data for event, data in events if event == "apperror"]
+    assert apperrors, "expected apperror for explicit retry failure"
+    assert not any(event == "done" for event, _ in events)
+    assert saved.messages[-1]["_error"] is True
+    assert saved.messages[-1]["content"] != "Visible retry text before explicit error"
+
+
+def test_auth_exception_retry_streamed_answer_emits_done_and_saves_final(tmp_path, monkeypatch):
+    session = _prepare_session(
+        "auth_exception_retry_streamed_answer",
+        "stream_auth_exception_retry_streamed_answer",
+        pending_user_message="Please recover from auth exception",
+    )
+
+    class AuthExceptionRetryStreamedAnswerAgent(MockAgent):
+        runs = 0
+
+        def run_conversation(self, **kwargs):
+            type(self).runs += 1
+            history = list(kwargs.get("conversation_history") or [])
+            if type(self).runs == 1:
+                raise RuntimeError("401 unauthorized: token expired")
+            if self.stream_delta_callback is not None:
+                self.stream_delta_callback("Recovered streamed reply after exception")
+            return {
+                "status": "ok",
+                "messages": history,
+                "error": "",
+            }
+
+    heal_rt = {
+        "provider": "test-provider",
+        "api_key": "fresh-key",
+        "base_url": None,
+    }
+
+    fake_queue = queue.Queue()
+    streaming.STREAMS["stream_auth_exception_retry_streamed_answer"] = fake_queue
+    config.STREAM_PARTIAL_TEXT["stream_auth_exception_retry_streamed_answer"] = ""
+
+    with mock.patch.object(streaming, "get_session", return_value=session), \
+         mock.patch.object(streaming, "_get_ai_agent", return_value=AuthExceptionRetryStreamedAnswerAgent), \
+         mock.patch.object(streaming, "resolve_model_provider", return_value=("test-model", "test-provider", None)), \
+         mock.patch("api.config.get_config", return_value={}), \
+         mock.patch("api.config._resolve_cli_toolsets", return_value=[]), \
+         mock.patch.object(streaming, "_attempt_credential_self_heal", return_value=heal_rt):
+        streaming._run_agent_streaming(
+            session_id=session.session_id,
+            msg_text=session.pending_user_message,
+            model="test-model",
+            workspace=str(tmp_path),
+            stream_id="stream_auth_exception_retry_streamed_answer",
+        )
+
+    saved = Session.load("auth_exception_retry_streamed_answer")
+    assert saved is not None
+
+    events = _queue_events(fake_queue)
+    assert any(event == "done" for event, _ in events)
+    assert any(event == "stream_end" for event, _ in events)
+    assert not any(event == "apperror" for event, _ in events)
+    assert saved.messages[-1]["role"] == "assistant"
+    assert saved.messages[-1]["content"] == "Recovered streamed reply after exception"
+    assert saved.context_messages[-1]["role"] == "assistant"
+    assert saved.context_messages[-1]["content"] == "Recovered streamed reply after exception"
+    assert not any(msg.get("_error") for msg in saved.messages)
+
+
 def test_success_repeated_assistant_text_stays_successful_current_turn(tmp_path, monkeypatch):
     session = _prepare_session("repeat_success", "stream_repeat_success", pending_user_message="Please say it again")
     _seed_prior_turn(
@@ -455,6 +642,66 @@ def test_non_auth_silent_failure_still_uses_no_response(tmp_path, monkeypatch):
     assert saved.messages[-1]["_error"] is True
 
 
+def test_ephemeral_explicit_provider_error_emits_apperror(tmp_path, monkeypatch):
+    session = _prepare_session(
+        "ephemeral_explicit_error",
+        "stream_ephemeral_explicit_error",
+        pending_user_message="Please fail ephemerally",
+    )
+
+    class EphemeralExplicitErrorAgent(MockAgent):
+        def run_conversation(self, **kwargs):
+            return {
+                "messages": list(kwargs.get("conversation_history") or []),
+                "error": "provider failed",
+            }
+
+    fake_queue = _run_stream(
+        monkeypatch,
+        session,
+        "stream_ephemeral_explicit_error",
+        EphemeralExplicitErrorAgent,
+        workspace=str(tmp_path),
+        ephemeral=True,
+    )
+
+    events = _queue_events(fake_queue)
+    apperrors = [data for event, data in events if event == "apperror"]
+    assert apperrors, "expected apperror for ephemeral provider failure"
+    assert apperrors[-1]["type"] == "error"
+    assert not any(event == "done" for event, _ in events)
+
+
+def test_ephemeral_empty_result_emits_no_response(tmp_path, monkeypatch):
+    session = _prepare_session(
+        "ephemeral_empty_result",
+        "stream_ephemeral_empty_result",
+        pending_user_message="Please say something ephemerally",
+    )
+
+    class EphemeralEmptyResultAgent(MockAgent):
+        def run_conversation(self, **kwargs):
+            return {
+                "messages": list(kwargs.get("conversation_history") or []),
+                "error": "",
+            }
+
+    fake_queue = _run_stream(
+        monkeypatch,
+        session,
+        "stream_ephemeral_empty_result",
+        EphemeralEmptyResultAgent,
+        workspace=str(tmp_path),
+        ephemeral=True,
+    )
+
+    events = _queue_events(fake_queue)
+    apperrors = [data for event, data in events if event == "apperror"]
+    assert apperrors, "expected no_response for ephemeral empty result"
+    assert apperrors[-1]["type"] == "no_response"
+    assert not any(event == "done" for event, _ in events)
+
+
 def test_live_settlement_empty_hint_does_not_append_empty_emphasis(tmp_path, monkeypatch):
     session = _prepare_session(
         "empty_hint_failure",
@@ -493,6 +740,264 @@ def test_live_settlement_empty_hint_does_not_append_empty_emphasis(tmp_path, mon
     assert not error_content.endswith("**")
 
 
+def test_silent_failure_suppressed_when_final_answer_already_persisted(tmp_path, monkeypatch):
+    session = _prepare_session(
+        "silent_failure_already_persisted",
+        "stream_silent_failure_already_persisted",
+        pending_user_message="Please use persisted answer",
+    )
+    persisted = Session.load("silent_failure_already_persisted")
+    assert persisted is not None
+    persisted.messages = [
+        {"role": "user", "content": "Please use persisted answer", "timestamp": 1234567890},
+        {"role": "assistant", "content": "Already persisted answer", "timestamp": 1234567891},
+    ]
+    persisted.context_messages = [
+        {"role": "user", "content": "Please use persisted answer", "timestamp": 1234567890},
+        {"role": "assistant", "content": "Already persisted answer", "timestamp": 1234567891},
+    ]
+    persisted.active_stream_id = "stream_silent_failure_already_persisted"
+    persisted.pending_user_message = "Please use persisted answer"
+    persisted.pending_attachments = ["attachment.txt"]
+    persisted.pending_started_at = 1234567890.0
+    persisted.save()
+
+    # Simulate a stale in-memory worker that did not see the already-finalized
+    # sidecar transcript. The no_response path must re-read persisted truth
+    # before appending a synthetic provider error.
+    session.messages = []
+    session.context_messages = []
+    models.SESSIONS[session.session_id] = session
+
+    class SilentFailureAfterPersistAgent(MockAgent):
+        def run_conversation(self, **kwargs):
+            return {
+                "messages": list(kwargs.get("conversation_history") or []),
+                "error": "",
+            }
+
+    fake_queue = _run_stream(
+        monkeypatch,
+        session,
+        "stream_silent_failure_already_persisted",
+        SilentFailureAfterPersistAgent,
+        workspace=str(tmp_path),
+    )
+    saved = Session.load("silent_failure_already_persisted")
+    assert saved is not None
+
+    events = _queue_events(fake_queue)
+    assert any(event == "done" for event, _ in events)
+    assert not any(event == "apperror" for event, _ in events)
+    assert saved.active_stream_id is None
+    assert saved.pending_user_message is None
+    assert saved.pending_attachments == []
+    assert saved.pending_started_at is None
+    assert saved.pending_user_source is None
+    assert saved.messages[-1]["role"] == "assistant"
+    assert saved.messages[-1]["content"] == "Already persisted answer"
+    assert saved.context_messages[-1]["role"] == "assistant"
+    assert saved.context_messages[-1]["content"] == "Already persisted answer"
+    assert not any(msg.get("_error") for msg in saved.messages)
+
+
+def test_repeated_prompt_old_answer_does_not_suppress_current_no_response(tmp_path, monkeypatch):
+    session = _prepare_session(
+        "repeated_prompt_silent_failure",
+        "stream_repeated_prompt_silent_failure",
+        pending_user_message="Repeat this exact request",
+    )
+    persisted = Session.load("repeated_prompt_silent_failure")
+    assert persisted is not None
+    persisted.messages = [
+        {"role": "user", "content": "Repeat this exact request", "timestamp": 1234567890.0},
+        {"role": "assistant", "content": "Old answer must not satisfy the new turn", "timestamp": 1234567890.1},
+    ]
+    persisted.context_messages = list(persisted.messages)
+    persisted.active_stream_id = "stream_repeated_prompt_silent_failure"
+    persisted.pending_user_message = "Repeat this exact request"
+    persisted.pending_attachments = ["attachment.txt"]
+    persisted.pending_started_at = 1234567890.75
+    persisted.save()
+
+    # The in-flight worker is for a newer same-text prompt in the same integer
+    # second as the older persisted prompt. Prompt text plus a 1s floor tolerance
+    # is still ambiguous under retries; because the persisted user row predates
+    # this turn's exact send anchor, the guard must fail closed and let the real
+    # no_response surface.
+    session.messages = []
+    session.context_messages = []
+    session.pending_started_at = 1234567890.75
+    models.SESSIONS[session.session_id] = session
+
+    class SilentFailureAfterOldRepeatedPromptAgent(MockAgent):
+        def run_conversation(self, **kwargs):
+            return {
+                "messages": list(kwargs.get("conversation_history") or []),
+                "error": "",
+            }
+
+    fake_queue = _run_stream(
+        monkeypatch,
+        session,
+        "stream_repeated_prompt_silent_failure",
+        SilentFailureAfterOldRepeatedPromptAgent,
+        workspace=str(tmp_path),
+    )
+    saved = Session.load("repeated_prompt_silent_failure")
+    assert saved is not None
+
+    events = _queue_events(fake_queue)
+    apperrors = [data for event, data in events if event == "apperror"]
+    assert apperrors, "expected no_response for the newer repeated prompt"
+    assert apperrors[-1]["type"] == "no_response"
+    assert not any(event == "done" for event, _ in events)
+    assert saved.messages[-1]["_error"] is True
+
+
+def test_eager_checkpointed_final_answer_suppresses_stale_no_response(tmp_path, monkeypatch):
+    """Eager checkpoint timestamps must preserve the current-turn anchor.
+
+    The chat-start eager path writes the current user turn before the streaming
+    worker runs. If that checkpoint truncates ``pending_started_at`` to integer
+    seconds, the strict current-turn guard rejects the real persisted answer and
+    appends the stale no_response this PR is meant to suppress.
+    """
+    msg_text = "Please use eager persisted answer"
+    session = _prepare_session(
+        "eager_checkpointed_final_answer",
+        "stream_eager_checkpointed_final_answer",
+        pending_user_message=msg_text,
+    )
+    session.pending_started_at = 1234567890.75
+    session.pending_user_source = "webui"
+    routes._checkpoint_user_message_for_eager_session_save(
+        session,
+        msg_text,
+        session.pending_attachments,
+        started_at=session.pending_started_at,
+        source=session.pending_user_source,
+    )
+    assert session.messages[0]["timestamp"] == session.pending_started_at
+    session.messages.append(
+        {"role": "assistant", "content": "Eager persisted answer", "timestamp": 1234567891.0}
+    )
+    session.context_messages = list(session.messages)
+    session.save()
+
+    # Simulate a stale in-memory worker that did not see the eager checkpointed
+    # user turn or the persisted final assistant answer.
+    session.messages = []
+    session.context_messages = []
+    models.SESSIONS[session.session_id] = session
+
+    class SilentFailureAfterEagerPersistedAgent(MockAgent):
+        def run_conversation(self, **kwargs):
+            return {
+                "messages": list(kwargs.get("conversation_history") or []),
+                "error": "",
+            }
+
+    fake_queue = _run_stream(
+        monkeypatch,
+        session,
+        "stream_eager_checkpointed_final_answer",
+        SilentFailureAfterEagerPersistedAgent,
+        workspace=str(tmp_path),
+    )
+    saved = Session.load("eager_checkpointed_final_answer")
+    assert saved is not None
+
+    events = _queue_events(fake_queue)
+    assert any(event == "done" for event, _ in events)
+    assert not any(event == "apperror" for event, _ in events)
+    assert saved.active_stream_id is None
+    assert saved.pending_user_message is None
+    assert saved.pending_attachments == []
+    assert saved.pending_started_at is None
+    assert saved.pending_user_source is None
+    assert saved.messages[-1]["role"] == "assistant"
+    assert saved.messages[-1]["content"] == "Eager persisted answer"
+    assert saved.context_messages[-1]["role"] == "assistant"
+    assert saved.context_messages[-1]["content"] == "Eager persisted answer"
+    assert not any(msg.get("_error") for msg in saved.messages)
+
+
+def test_persisted_final_guard_accepts_already_settled_previous_display():
+    """A stale no_response branch must trust a finished persisted transcript.
+
+    Real WebUI recovery can re-enter the silent-failure branch after the sidecar
+    and state.db already contain the current user turn and final assistant
+    answer. In that case the stale worker's ``previous_display`` may itself be
+    the already-settled transcript; the persisted-truth guard must not reject
+    the answer merely because it falls before that stale boundary.
+    """
+    msg_text = "repeat visible CUA tests"
+    settled = [
+        {"role": "user", "content": msg_text, "timestamp": 1},
+        {"role": "assistant", "content": "Visible CUA tests completed", "timestamp": 2},
+    ]
+
+    assert streaming._messages_have_final_assistant_for_current_turn(
+        settled,
+        msg_text,
+        previous_display=list(settled),
+        min_user_timestamp=1,
+    ) is True
+
+
+def test_persisted_final_guard_trusts_timestamp_anchor_across_previous_display_drift():
+    """A proven current user timestamp must not be rejected by cross-list indexes."""
+    msg_text = "repeat visible CUA tests"
+    previous_display = [
+        {"role": "user", "content": "older", "timestamp": 1},
+        {"role": "assistant", "content": "older answer", "timestamp": 2},
+        {"role": "user", "content": "different pending view", "timestamp": 3},
+    ]
+    persisted = [
+        {"role": "assistant", "content": "compression marker", "timestamp": 4},
+        {"role": "user", "content": msg_text, "timestamp": 100.8},
+        {"role": "assistant", "content": "Current persisted answer", "timestamp": 101.0},
+    ]
+
+    assert streaming._messages_have_final_assistant_for_current_turn(
+        persisted,
+        msg_text,
+        previous_display=previous_display,
+        min_user_timestamp=100.8,
+    ) is True
+
+
+def test_persisted_final_guard_rejects_pre_anchor_assistant_candidate():
+    msg_text = "repeat visible CUA tests"
+    persisted = [
+        {"role": "user", "content": msg_text, "timestamp": 100.8},
+        {"role": "assistant", "content": "Old out-of-order answer", "timestamp": 100.2},
+    ]
+
+    assert streaming._messages_have_final_assistant_for_current_turn(
+        persisted,
+        msg_text,
+        previous_display=[{"role": "user", "content": msg_text, "timestamp": 100.8}],
+        min_user_timestamp=100.8,
+    ) is False
+
+
+def test_persisted_final_guard_accepts_ts_anchor_alias():
+    msg_text = "repeat visible CUA tests"
+    persisted = [
+        {"role": "user", "content": msg_text, "_ts": 100.8},
+        {"role": "assistant", "content": "Current persisted answer", "_ts": 101.0},
+    ]
+
+    assert streaming._messages_have_final_assistant_for_current_turn(
+        persisted,
+        msg_text,
+        previous_display=[{"role": "user", "content": msg_text, "_ts": 100.8}],
+        min_user_timestamp=100.8,
+    ) is True
+
+
 def test_completed_assistant_answer_with_stale_partial_flag_settles_done(tmp_path, monkeypatch):
     session = _prepare_session(
         "completed_answer_stale_partial",
@@ -526,6 +1031,159 @@ def test_completed_assistant_answer_with_stale_partial_flag_settles_done(tmp_pat
     assert saved.messages[-1]["role"] == "assistant"
     assert saved.messages[-1]["content"] == "Completed answer"
     assert not any(msg.get("_error") for msg in saved.messages)
+
+
+def test_streamed_answer_without_result_message_is_saved_as_final_answer(tmp_path, monkeypatch):
+    """Visible streamed text is a real answer when no terminal error was reported.
+
+    Regression for the live WebUI trace in session 3c748eadef9a: the agent
+    streamed a complete assistant answer via ``stream_delta_callback`` and then
+    returned a result payload that replayed only conversation history plus an
+    empty error field. WebUI must not append ``No response from provider`` after
+    text it already showed to the user.
+    """
+    session = _prepare_session(
+        "streamed_answer_no_result_message",
+        "stream_streamed_answer_no_result_message",
+        pending_user_message="Please ship the CUA patch",
+    )
+
+    class StreamedAnswerNoResultAgent(MockAgent):
+        def run_conversation(self, **kwargs):
+            if self.stream_delta_callback is not None:
+                self.stream_delta_callback("Implemented and verified. Ready for review.")
+            return {
+                "messages": list(kwargs.get("conversation_history") or []),
+                "error": "",
+            }
+
+    fake_queue = _run_stream(
+        monkeypatch,
+        session,
+        "stream_streamed_answer_no_result_message",
+        StreamedAnswerNoResultAgent,
+        workspace=str(tmp_path),
+    )
+    saved = Session.load("streamed_answer_no_result_message")
+    assert saved is not None
+
+    events = _queue_events(fake_queue)
+    assert any(event == "done" for event, _ in events)
+    assert not any(event == "apperror" for event, _ in events)
+    assert saved.messages[-1]["role"] == "assistant"
+    assert saved.messages[-1]["content"] == "Implemented and verified. Ready for review."
+    assert saved.context_messages[-1]["role"] == "assistant"
+    assert saved.context_messages[-1]["content"] == "Implemented and verified. Ready for review."
+    assert not any(msg.get("_partial") for msg in saved.messages)
+    assert not any(msg.get("_error") for msg in saved.messages)
+
+
+def test_streamed_answer_with_explicit_provider_error_still_errors(tmp_path, monkeypatch):
+    session = _prepare_session(
+        "streamed_answer_explicit_error",
+        "stream_streamed_answer_explicit_error",
+        pending_user_message="Please stream then fail explicitly",
+    )
+
+    class StreamedAnswerExplicitErrorAgent(MockAgent):
+        def run_conversation(self, **kwargs):
+            if self.stream_delta_callback is not None:
+                self.stream_delta_callback("Visible text before explicit provider error")
+            return {
+                "messages": list(kwargs.get("conversation_history") or []),
+                "error": "provider failed after streaming",
+            }
+
+    fake_queue = _run_stream(
+        monkeypatch,
+        session,
+        "stream_streamed_answer_explicit_error",
+        StreamedAnswerExplicitErrorAgent,
+        workspace=str(tmp_path),
+    )
+    saved = Session.load("streamed_answer_explicit_error")
+    assert saved is not None
+
+    events = _queue_events(fake_queue)
+    apperrors = [data for event, data in events if event == "apperror"]
+    assert apperrors, "expected apperror for explicit provider error"
+    assert not any(event == "done" for event, _ in events)
+    assert saved.messages[-1]["_error"] is True
+    assert saved.messages[-1]["content"] != "Visible text before explicit provider error"
+
+
+def test_streamed_answer_with_compression_exhausted_still_errors(tmp_path, monkeypatch):
+    session = _prepare_session(
+        "streamed_answer_compression_exhausted",
+        "stream_streamed_answer_compression_exhausted",
+        pending_user_message="Please stream then exhaust compression",
+    )
+
+    class StreamedAnswerCompressionExhaustedAgent(MockAgent):
+        def run_conversation(self, **kwargs):
+            if self.stream_delta_callback is not None:
+                self.stream_delta_callback("Visible text before compression exhaustion")
+            return {
+                "status": "failed",
+                "failed": True,
+                "partial": True,
+                "compression_exhausted": True,
+                "messages": list(kwargs.get("conversation_history") or []),
+                "error": "Context length exceeded: cannot compress further.",
+            }
+
+    fake_queue = _run_stream(
+        monkeypatch,
+        session,
+        "stream_streamed_answer_compression_exhausted",
+        StreamedAnswerCompressionExhaustedAgent,
+        workspace=str(tmp_path),
+    )
+    saved = Session.load("streamed_answer_compression_exhausted")
+    assert saved is not None
+
+    events = _queue_events(fake_queue)
+    apperrors = [data for event, data in events if event == "apperror"]
+    assert apperrors, "expected apperror for compression exhaustion"
+    assert apperrors[-1]["type"] == "compression_exhausted"
+    assert not any(event == "done" for event, _ in events)
+    assert saved.messages[-1]["_error"] is True
+    assert saved.messages[-1]["content"] != "Visible text before compression exhaustion"
+
+
+def test_streamed_answer_with_tool_limit_still_errors(tmp_path, monkeypatch):
+    session = _prepare_session(
+        "streamed_answer_tool_limit",
+        "stream_streamed_answer_tool_limit",
+        pending_user_message="Please stream then hit tool limit",
+    )
+
+    class StreamedAnswerToolLimitAgent(MockAgent):
+        def run_conversation(self, **kwargs):
+            if self.stream_delta_callback is not None:
+                self.stream_delta_callback("Visible text before tool limit")
+            return {
+                "turn_exit_reason": "max_iterations_reached",
+                "messages": list(kwargs.get("conversation_history") or []),
+                "error": "",
+            }
+
+    fake_queue = _run_stream(
+        monkeypatch,
+        session,
+        "stream_streamed_answer_tool_limit",
+        StreamedAnswerToolLimitAgent,
+        workspace=str(tmp_path),
+    )
+    saved = Session.load("streamed_answer_tool_limit")
+    assert saved is not None
+
+    events = _queue_events(fake_queue)
+    apperrors = [data for event, data in events if event == "apperror"]
+    assert apperrors, "expected apperror for tool-limit result without final answer"
+    assert not any(event == "done" for event, _ in events)
+    assert saved.messages[-1]["_error"] is True
+    assert saved.messages[-1]["content"] != "Visible text before tool limit"
 
 
 def test_stale_partial_with_unfinished_tool_call_still_reports_no_response(tmp_path, monkeypatch):
@@ -570,7 +1228,7 @@ def test_stale_partial_with_unfinished_tool_call_still_reports_no_response(tmp_p
     assert saved.messages[-1]["_error"] is True
 
 
-def test_stale_partial_repeated_prompt_replay_still_reports_no_response(tmp_path, monkeypatch):
+def test_soft_partial_streamed_answer_for_repeated_prompt_is_saved_as_current_answer(tmp_path, monkeypatch):
     session = _prepare_session(
         "repeated_prompt_replay_stale_partial",
         "stream_repeated_prompt_replay_stale_partial",
@@ -585,7 +1243,7 @@ def test_stale_partial_repeated_prompt_replay_still_reports_no_response(tmp_path
     class RepeatedPromptReplayStalePartialAgent(MockAgent):
         def run_conversation(self, **kwargs):
             if self.stream_delta_callback is not None:
-                self.stream_delta_callback("Partial text before stale replay")
+                self.stream_delta_callback("Current streamed answer for the repeated prompt")
             return {
                 "status": "partial",
                 "partial": True,
@@ -604,11 +1262,12 @@ def test_stale_partial_repeated_prompt_replay_still_reports_no_response(tmp_path
     assert saved is not None
 
     events = _queue_events(fake_queue)
-    apperrors = [data for event, data in events if event == "apperror"]
-    assert apperrors, "expected apperror for repeated-prompt stale replay"
-    assert apperrors[-1]["type"] == "no_response"
-    assert not any(event == "done" for event, _ in events)
-    assert saved.messages[-1]["_error"] is True
+    assert any(event == "done" for event, _ in events)
+    assert not any(event == "apperror" for event, _ in events)
+    assert saved.messages[-1]["role"] == "assistant"
+    assert saved.messages[-1]["content"] == "Current streamed answer for the repeated prompt"
+    assert any(msg.get("role") == "assistant" and msg.get("content") == "Old answer" for msg in saved.messages)
+    assert not any(msg.get("_error") for msg in saved.messages)
 
 
 def test_hard_failure_with_completed_answer_still_reports_no_response(tmp_path, monkeypatch):
@@ -645,35 +1304,59 @@ def test_hard_failure_with_completed_answer_still_reports_no_response(tmp_path, 
     assert saved.messages[-1]["_error"] is True
 
 
-def test_non_auth_partial_delivery_persists_error_turn(tmp_path, monkeypatch):
-    session = _prepare_session("partial_escape", "stream_partial_escape", pending_user_message="Please handle partial silence")
+def test_streamed_answer_with_soft_partial_result_is_saved_as_final_answer(tmp_path, monkeypatch):
+    """Soft partial/no-error results must not append no_response after visible text.
 
-    class PartialSilentFailureAgent(MockAgent):
+    Regression for live session dc3acc5acdaa: the agent streamed a complete
+    answer via ``stream_delta_callback`` and then returned a soft ``partial``
+    result with no explicit provider error and no final assistant row. WebUI
+    should trust the visible streamed answer instead of appending a misleading
+    ``No response from provider`` card.
+    """
+    session = _prepare_session(
+        "soft_partial_streamed_answer",
+        "stream_soft_partial_streamed_answer",
+        pending_user_message="Please finish with streamed text",
+    )
+
+    class SoftPartialStreamedAnswerAgent(MockAgent):
         def run_conversation(self, **kwargs):
             if self.stream_delta_callback is not None:
-                self.stream_delta_callback("Partial text before failure")
+                self.stream_delta_callback("Completed visible answer from the stream.")
             return {
+                "status": "partial",
+                "partial": True,
                 "messages": list(kwargs.get("conversation_history") or []),
                 "error": "",
             }
 
-    fake_queue = _run_stream(monkeypatch, session, "stream_partial_escape", PartialSilentFailureAgent, workspace=str(tmp_path))
-    saved = Session.load("partial_escape")
+    fake_queue = _run_stream(
+        monkeypatch,
+        session,
+        "stream_soft_partial_streamed_answer",
+        SoftPartialStreamedAnswerAgent,
+        workspace=str(tmp_path),
+    )
+    saved = Session.load("soft_partial_streamed_answer")
     assert saved is not None
 
-    partial = next((msg for msg in saved.messages if msg.get("_partial")), None)
-    assert partial is not None
-    assert partial["content"] == "Partial text before failure"
-
     events = _queue_events(fake_queue)
-    apperrors = [data for event, data in events if event == "apperror"]
-    assert apperrors, "expected apperror for partial silent failure"
-    assert apperrors[-1]["type"] == "no_response"
-    assert saved.messages[-1]["_error"] is True
+    assert any(event == "done" for event, _ in events)
+    assert not any(event == "apperror" for event, _ in events)
+    assert saved.messages[-1]["role"] == "assistant"
+    assert saved.messages[-1]["content"] == "Completed visible answer from the stream."
+    assert saved.context_messages[-1]["role"] == "assistant"
+    assert saved.context_messages[-1]["content"] == "Completed visible answer from the stream."
+    assert not any(msg.get("_partial") for msg in saved.messages)
+    assert not any(msg.get("_error") for msg in saved.messages)
 
 
-def test_non_auth_seeded_multi_turn_partial_persists_error_turn(tmp_path, monkeypatch):
-    session = _prepare_session("seeded_partial_escape", "stream_seeded_partial_escape", pending_user_message="Please handle partial silence")
+def test_non_auth_seeded_multi_turn_partial_saves_streamed_text_as_final_answer(tmp_path, monkeypatch):
+    session = _prepare_session(
+        "seeded_partial_escape",
+        "stream_seeded_partial_escape",
+        pending_user_message="Please handle partial silence",
+    )
     _seed_prior_turn(
         session,
         prior_user="Earlier question",
@@ -683,8 +1366,10 @@ def test_non_auth_seeded_multi_turn_partial_persists_error_turn(tmp_path, monkey
     class PartialSilentFailureAgent(MockAgent):
         def run_conversation(self, **kwargs):
             if self.stream_delta_callback is not None:
-                self.stream_delta_callback("Partial text before failure")
+                self.stream_delta_callback("Streamed answer before soft partial result")
             return {
+                "status": "partial",
+                "partial": True,
                 "messages": list(kwargs.get("conversation_history") or []),
                 "error": "",
             }
@@ -694,14 +1379,16 @@ def test_non_auth_seeded_multi_turn_partial_persists_error_turn(tmp_path, monkey
     assert saved is not None
 
     assert any(msg.get("role") == "assistant" and msg.get("content") == "Earlier answer" for msg in saved.messages)
-    assert any(msg.get("_partial") and msg.get("content") == "Partial text before failure" for msg in saved.messages)
-    assert saved.messages[-1]["_error"] is True
+    assert saved.messages[-1]["role"] == "assistant"
+    assert saved.messages[-1]["content"] == "Streamed answer before soft partial result"
+    assert saved.context_messages[-1]["role"] == "assistant"
+    assert saved.context_messages[-1]["content"] == "Streamed answer before soft partial result"
+    assert not any(msg.get("_partial") for msg in saved.messages)
+    assert not any(msg.get("_error") for msg in saved.messages)
 
     events = _queue_events(fake_queue)
-    apperrors = [data for event, data in events if event == "apperror"]
-    assert apperrors, "expected apperror for seeded partial silent failure"
-    assert apperrors[-1]["type"] == "no_response"
-    assert not any(event == "done" for event, _ in events)
+    assert any(event == "done" for event, _ in events)
+    assert not any(event == "apperror" for event, _ in events)
 
 
 def test_non_auth_seeded_replayed_assistant_does_not_satisfy_current_turn(tmp_path, monkeypatch):

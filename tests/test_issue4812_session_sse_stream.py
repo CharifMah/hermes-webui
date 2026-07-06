@@ -330,3 +330,46 @@ def test_session_route_live_delivery_skips_replayed_active_run_items(monkeypatch
     assert "id: run_active:2\n" in body
     assert "event: stream_end\n" in body
     assert stream.unsubscribed is True
+
+
+def test_session_route_live_delivery_without_cursor_keeps_buffered_active_items(monkeypatch):
+    import api.routes as routes
+
+    class _FakeStream:
+        def __init__(self):
+            self.q = queue.Queue()
+            self.q.put_nowait(("token", {"text": "buffered"}, "run_active:1"))
+            self.q.put_nowait(("stream_end", {"status": "done"}, "run_active:2"))
+
+        def subscribe_with_snapshot(self):
+            return self.q, {"last_event_id": "run_active:1", "offline_buffered_events": 1}
+
+    stream = _FakeStream()
+    monkeypatch.setattr(routes, "_session_id_visible_to_request_profile", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        routes,
+        "get_session",
+        lambda sid, metadata_only=False: SimpleNamespace(
+            session_id=sid,
+            compact=lambda **_kwargs: {"session_id": sid, "title": "Session"},
+        ),
+    )
+    monkeypatch.setattr(routes, "_active_run_stream_for_session", lambda *_args, **_kwargs: "run_active")
+    monkeypatch.setattr(routes, "STREAMS", {"run_active": stream})
+    monkeypatch.setattr(
+        routes,
+        "read_session_run_events",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("replay should not run without a cursor")),
+    )
+
+    handler = _FakeHandler()
+    routes._handle_session_sse_stream_for_session(
+        handler,
+        urlparse("/api/sessions/session_1/events"),
+        "session_1",
+    )
+
+    body = handler.wfile.getvalue().decode("utf-8")
+    assert "id: run_active:1\n" in body
+    assert "id: run_active:2\n" in body
+    assert "event: stream_end\n" in body

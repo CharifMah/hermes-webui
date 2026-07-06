@@ -16183,16 +16183,16 @@ def _handle_session_sse_stream_for_session(handler, parsed, session_id):
         else:
             subscriber = stream.subscribe() if hasattr(stream, "subscribe") else stream
             stream_snapshot = {}
-        replay_cutoff_seq = _run_journal_same_run_seq(
-            str(stream_snapshot.get("last_event_id") or ""),
-            active_stream_id,
-        )
     try:
         if resume_event_id:
             replay = read_session_run_events(session_id, after_event_id=resume_event_id)
             if replay.get("status") != "ok":
                 _sse(handler, "session_snapshot", _session_snapshot_payload(session, active_stream_id=active_stream_id))
             else:
+                replay_cutoff_seq = _run_journal_same_run_seq(
+                    str(stream_snapshot.get("last_event_id") or ""),
+                    active_stream_id,
+                )
                 for entry in replay.get("events") or []:
                     event_run_id = str(entry.get("run_id") or "")
                     event_seq = entry.get("seq")
@@ -16229,10 +16229,6 @@ def _handle_session_sse_stream_for_session(handler, parsed, session_id):
                 else:
                     subscriber = stream.subscribe() if hasattr(stream, "subscribe") else stream
                     stream_snapshot = {}
-                replay_cutoff_seq = _run_journal_same_run_seq(
-                    str(stream_snapshot.get("last_event_id") or ""),
-                    active_stream_id,
-                )
                 break
         if subscriber is None:
             return True

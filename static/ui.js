@@ -953,6 +953,12 @@ function _captureMessageViewportAnchor(){
         key:row&&row.dataset?String(row.dataset.messageAnchorKey||''):'',
         topOffset:rect.top-containerRect.top,
         topPadBefore,
+        // Snapshot the scroll geometry at capture so a later realign can detect that
+        // content grew ABOVE the viewport between capture and restore — the streaming
+        // case where the anchor's topOffset is stale and realigning to it would yank a
+        // still reader backward (issue #5637).
+        scrollHeightAtCapture:container.scrollHeight,
+        scrollTopAtCapture:container.scrollTop,
       };
     }
   }
@@ -1029,6 +1035,28 @@ function _restoreMessageViewportAnchor(anchor, rawIdxDelta){
   const containerRect=container.getBoundingClientRect();
   const rect=row.getBoundingClientRect();
   const targetTop=Number(anchor.topOffset)||0;
+  // Streaming stale-anchor guard (issue #5637). During a live stream, content grows
+  // ABOVE the viewport between anchor capture and this restore, so the anchor's
+  // captured topOffset is stale and the realign delta becomes a spurious few-hundred-px
+  // value that yanks a still reader backward. Detect it by content growth + absence of
+  // real input intent — NOT by a scrollTop diff, because on an overflow-anchor:auto
+  // container the browser itself moves scrollTop to compensate the growth (so a still
+  // reader's scrollTop is not stationary). _recentMessage*ScrollIntent reflects genuine
+  // touch/wheel/key input, which the browser's anchor layer never writes. If content
+  // grew since capture AND there is no recent input intent AND the realign would move
+  // scrollTop non-trivially, refuse it and let the browser overflow-anchor hold. An
+  // actively scrolling reader (recent intent) keeps the legitimate realign; legacy
+  // snapshots without the captured geometry keep prior behavior.
+  const _realignDelta=(rect.top-containerRect.top)-targetTop;
+  const _shAtCap=Number(anchor.scrollHeightAtCapture);
+  if(Number.isFinite(_shAtCap)){
+    const _grewAbove=(container.scrollHeight-_shAtCap)>4;
+    const _activeIntent=(typeof _recentMessageScrollIntent==='function' && _recentMessageScrollIntent())
+      || (typeof _recentMessageTouchScrollIntent==='function' && _recentMessageTouchScrollIntent());
+    if(_grewAbove&&!_activeIntent&&Math.abs(_realignDelta)>8){
+      return false;
+    }
+  }
   _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
   // Mobile-only jump fix: the resting overflow-anchor on .messages is `auto` on
   // touch devices (CSS media query keeps it `none` only for hover+fine-pointer
@@ -13259,6 +13287,28 @@ function _restoreMessageScrollSnapshotSameFrame(snapshot){
     const target=(snapshot.pinned===true&&Number.isFinite(bottom))
       ? maxTop-Math.max(0,bottom)
       : Number(snapshot.top)||0;
+    // Streaming stale-snapshot guard (issue #5637). The userUnpinned check above is
+    // defeated when a live stream re-pins the state machine (a scrollHeight-collapse
+    // scroll event flips userUnpinned back to false even though the reader is up in
+    // history), so this absolute snapshot.top write still fires and yanks a still
+    // reader — snapshot.top was captured before the streaming chunk grew above-viewport
+    // height, so it is stale. Mirror the realign guard: if content grew since the
+    // snapshot AND there is no recent real input intent AND the write would move
+    // scrollTop non-trivially, refuse it and let the browser overflow-anchor hold.
+    // Pinned tail-followers (target is bottom-relative, not snapshot.top) are
+    // unaffected; an actively scrolling reader has intent and keeps the restore.
+    const _snapSH=Number(snapshot.scrollHeight);
+    const _grewSinceSnap=Number.isFinite(_snapSH)&&_snapSH>0&&(el.scrollHeight-_snapSH)>4;
+    const _fbActiveIntent=(typeof _recentMessageScrollIntent==='function' && _recentMessageScrollIntent())
+      || (typeof _recentMessageTouchScrollIntent==='function' && _recentMessageTouchScrollIntent());
+    if(snapshot.pinned!==true && _grewSinceSnap && !_fbActiveIntent
+       && Math.abs((Math.max(0,Math.min(target,maxTop)))-el.scrollTop)>8){
+      _lastScrollTop=el.scrollTop;_lastMessageClientHeight=el.clientHeight;
+      _messageUserUnpinned=true;
+      _scrollPinned=false;
+      _nearBottomCount=0;
+      return;
+    }
     _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
     el.scrollTop=Math.max(0,Math.min(target,maxTop));
   }

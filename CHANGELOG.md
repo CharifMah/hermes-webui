@@ -3,6 +3,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **CSV files shared in chat keep a download link again.** A `MEDIA:` CSV rendered an inline table preview but — unlike every other media type — dropped the download affordance, so the file couldn't be retrieved once previewed. The preview header now shows a 📎 download link (via the correct `api/media?…&download=1` path), and the link stays visible even when the inline table itself fails to render, so CSV files exchanged through chat output remain retrievable. Thanks @ruizanthony. (#5792)
+
 ### Added
 
 - **Resumable session event streams (server contract).** A new per-session SSE endpoint (`GET /api/sessions/{id}/events`) lets a client reconnect and resume from where its stream dropped — replaying journalled events after a cursor (standard EventSource `Last-Event-ID`, with an `after_event_id` query fallback for clients that can't set the header), deduped against live events at an atomic subscribe/snapshot boundary. Replay is bounded (per-line byte cap enforced pre-decode + an event-count limit) and *honest*: any limit, gap, or non-contiguous cursor returns a fresh `session_snapshot` recovery boundary so the client re-syncs rather than silently losing events. An idle no-cursor subscriber also re-syncs if a run starts and finishes entirely within one keepalive tick. Cross-profile access is refused (404) before any replay. This is the Phase-1 server contract; no client consumes it yet. Thanks @rodboev. (#5677, #4812)

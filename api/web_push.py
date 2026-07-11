@@ -33,9 +33,18 @@ class _PushTransportUnavailable(ValueError):
 
 
 def _subscription_store_path() -> Path:
-    from api.profiles import _DEFAULT_HERMES_HOME
+    # Scope the Web Push subscription store to the ACTIVE profile's home, not the
+    # base home. Both the subscribe path (a request handler) and the delivery path
+    # (a streaming turn's completion) run under the same active-profile context
+    # (get_hermes_home() honours the per-request TLS profile, issue #798), so each
+    # profile gets its own isolated subscription store — a subscription registered
+    # under profile A can only receive profile A's notification content, never
+    # another profile's. (Previously keyed under the shared base home, which let
+    # push subscriptions/notification content bleed across profiles in a
+    # multi-profile deployment — a profile-isolation gap.)
+    from api.profiles import get_active_hermes_home
 
-    base = Path(_DEFAULT_HERMES_HOME).expanduser()
+    base = Path(get_active_hermes_home()).expanduser()
     base.mkdir(parents=True, exist_ok=True)
     return base / _PUSH_STORE_NAME
 

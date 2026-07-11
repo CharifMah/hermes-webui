@@ -136,6 +136,47 @@ def test_subscription_store_round_trip_and_stale_prune(monkeypatch, tmp_path):
     assert [sub["endpoint"] for sub in web_push.list_subscriptions(owner_key="owner-b")] == ["https://push.example/other"]
 
 
+def test_subscription_store_is_scoped_per_active_profile(monkeypatch, tmp_path):
+    """A push subscription registered while profile A is active must not be
+    visible (or deliverable) while profile B is active — the store is scoped to
+    the active profile's home, not the shared base home. Regression for the
+    cross-profile push-content bleed (#4664 gate finding)."""
+    import api.web_push as web_push
+    import api.profiles as profiles
+
+    home_a = tmp_path / "profile-a"
+    home_b = tmp_path / "profile-b"
+    home_a.mkdir()
+    home_b.mkdir()
+
+    # Drive the REAL _subscription_store_path() through get_active_hermes_home so
+    # this test proves the path scoping, not a monkeypatched store.
+    active = {"home": home_a}
+    monkeypatch.setattr(profiles, "get_active_hermes_home", lambda: active["home"])
+
+    # Register a subscription while profile A is active.
+    active["home"] = home_a
+    web_push.upsert_subscription(_subscription("https://push.example/profile-a"), owner_key="owner-a")
+
+    # Profile A sees it; the file lives under profile A's home only.
+    assert [s["endpoint"] for s in web_push.list_subscriptions(owner_key="owner-a")] == ["https://push.example/profile-a"]
+    assert (home_a / "webui_push_subscriptions.json").exists()
+    assert not (home_b / "webui_push_subscriptions.json").exists()
+
+    # Switch to profile B: the profile-A subscription is invisible, and delivery
+    # for owner-a under profile B finds nothing to send to (no cross-profile bleed).
+    active["home"] = home_b
+    assert web_push.list_subscriptions(owner_key="owner-a") == []
+    assert web_push.list_subscriptions() == []
+
+    # A subscription registered under profile B stays isolated from profile A.
+    web_push.upsert_subscription(_subscription("https://push.example/profile-b"), owner_key="owner-b")
+    assert [s["endpoint"] for s in web_push.list_subscriptions(owner_key="owner-b")] == ["https://push.example/profile-b"]
+    active["home"] = home_a
+    assert web_push.list_subscriptions(owner_key="owner-b") == []
+    assert [s["endpoint"] for s in web_push.list_subscriptions(owner_key="owner-a")] == ["https://push.example/profile-a"]
+
+
 def test_push_routes_support_status_subscribe_and_delete(monkeypatch, tmp_path):
     import api.config as config
     import api.routes as routes

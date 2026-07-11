@@ -2960,6 +2960,16 @@ def model_with_provider_context(model_id: str, model_provider: str | None = None
     if provider in _ACP_SUBPROCESS_PROVIDERS:
         return f"@{provider}:{model}"
 
+    # Plugin-only model providers (e.g. 9router, and other model plugins whose
+    # slugs are not in the static provider tables) route through the plugin, not
+    # the default provider. This MUST come before the `provider == config_provider`
+    # bare-passthrough below: when a plugin provider is ALSO the configured
+    # provider, returning a bare model would drop the '@plugin:' hint and the model
+    # would be sent to the wrong backend. Emit the explicit hint so it stays
+    # routable to the plugin that surfaced it. (#5909 gate finding)
+    if _is_plugin_model_provider(provider):
+        return f"@{provider}:{model}"
+
     # If the selected provider is already the configured provider, leaving the
     # model bare preserves provider-specific base_url/proxy settings.
     if provider == config_provider:
@@ -2979,16 +2989,8 @@ def model_with_provider_context(model_id: str, model_provider: str | None = None
     if isinstance(providers_cfg, dict) and provider in providers_cfg:
         return f"@{provider}:{model}"
 
-    # Plugin-only model providers (e.g. 9router, and other model plugins whose
-    # slugs are not in the static provider tables) route through the plugin,
-    # not the default provider. A surfaced plugin-only model such as
-    # 'gh/claude-sonnet-4.5' carries a '/' in its ID, so without this branch it
-    # would fall through to the bare-passthrough below and inherit the default
-    # provider. Emit the explicit '@plugin:model' hint so the model stays
-    # routable to the plugin that surfaced it. This mirrors the explicit
-    # configured-provider handling above.
-    if _is_plugin_model_provider(provider):
-        return f"@{provider}:{model}"
+    # (Plugin-only provider routing handled above, before the config_provider
+    # bare-passthrough.)
 
     # For non-OpenRouter slash IDs without an explicit configured provider,
     # keep the ID intact so existing custom/proxy base_url routing and

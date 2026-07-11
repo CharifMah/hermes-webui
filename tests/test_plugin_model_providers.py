@@ -430,3 +430,45 @@ class TestPluginModelProviderRouting:
             config.cfg.clear()
             config.cfg.update(old_cfg)
             invalidate_plugin_model_provider_cache()
+
+    def test_plugin_provider_routes_even_when_it_is_the_configured_provider(self, monkeypatch):
+        # #5909 gate finding: the plugin-routing branch must run BEFORE the
+        # `provider == config_provider` bare-passthrough. When the ACTIVE plugin
+        # provider is also the configured default, returning a bare model would
+        # drop the '@plugin:' hint and route to the wrong backend.
+        profile = SimpleNamespace(
+            name="gmi",
+            display_name="GMI",
+            env_vars=("GMI_API_KEY",),
+            auth_type="api_key",
+            aliases=(),
+            fallback_models=("anthropic/claude-sonnet-4.6",),
+        )
+
+        def _fake_list_providers():
+            return [profile]
+
+        fake_providers = types.ModuleType("providers")
+        fake_providers.list_providers = _fake_list_providers
+        monkeypatch.setitem(sys.modules, "providers", fake_providers)
+        invalidate_plugin_model_provider_cache()
+
+        old_cfg = dict(config.cfg)
+        config.cfg.clear()
+        # The plugin IS the configured provider now.
+        config.cfg["model"] = {"provider": "gmi", "default": "anthropic/claude-sonnet-4.6"}
+        config.cfg["providers"] = {}
+        try:
+            assert config._is_plugin_model_provider("gmi")
+            routed = config.model_with_provider_context(
+                "anthropic/claude-sonnet-4.6", "gmi"
+            )
+            assert routed == "@gmi:anthropic/claude-sonnet-4.6", (
+                "an active plugin provider must keep its '@plugin:' routing hint "
+                "even when it equals the configured provider, got "
+                f"{routed!r}"
+            )
+        finally:
+            config.cfg.clear()
+            config.cfg.update(old_cfg)
+            invalidate_plugin_model_provider_cache()

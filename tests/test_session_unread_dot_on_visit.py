@@ -79,6 +79,22 @@ def test_load_session_acknowledges_visit_before_and_after_message_load():
     )
 
 
+def test_post_load_reack_is_guarded_by_active_view():
+    # #5917 gate finding: the post-load re-ack must be gated on
+    # _isSessionActivelyViewedForList(sid). A completion that lands while
+    # _ensureMessagesLoaded() is in flight AND the tab then goes hidden is
+    # correctly marked unread — an UNCONDITIONAL post-load ack would wrongly
+    # clear that hidden-tab-completion marker.
+    block = _load_session_block()
+    loading_clear = block.find("if (_isCurrentLoad()) _loadingSessionId = null;\n\n  // Re-acknowledge")
+    guard = block.find("_isSessionActivelyViewedForList(sid)", loading_clear)
+    second_ack = block.find("_acknowledgeSessionVisit(", loading_clear)
+    assert guard != -1 and guard < second_ack, (
+        "the post-load re-acknowledge must be guarded by "
+        "_isSessionActivelyViewedForList(sid) so a hidden-tab completion stays unread"
+    )
+
+
 def test_same_session_reselect_clears_stale_unread():
     block = _load_session_block()
     guard = block.find("if(currentSid===sid && !forceReload && (!_loadingSessionId || _loadingSessionId===sid)){")

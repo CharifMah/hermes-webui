@@ -2117,7 +2117,16 @@ async function loadSession(sid){
   // sidebar /api/sessions poll can land while _ensureMessagesLoaded is in
   // flight and re-mark the open session unread; re-syncing here clears that
   // sticky dot once the transcript is settled (#4946).
-  if (S.session && S.session.session_id === sid) {
+  //
+  // Gate the final ack on _isSessionActivelyViewedForList(sid): a completion
+  // that lands while _ensureMessagesLoaded() is in flight AND the tab then goes
+  // hidden is correctly marked unread — an UNCONDITIONAL ack here would wrongly
+  // clear that hidden-tab-completion marker. Only clear when the session is
+  // still actively viewed. (#5917 gate finding)
+  if (
+    S.session && S.session.session_id === sid &&
+    (typeof _isSessionActivelyViewedForList !== 'function' || _isSessionActivelyViewedForList(sid))
+  ) {
     _acknowledgeSessionVisit(
       sid,
       Number(S.session.message_count || 0),

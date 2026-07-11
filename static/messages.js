@@ -2603,6 +2603,13 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     const sourceEvent={
       ...raw,
       source_event_type:sourceEventType,
+      // Persist a creation timestamp the FIRST time we see this source event, so
+      // the worklog event timestamp (#5700/#5739) survives settlement. Reasoning
+      // events carry no server timestamp; without this, the live DOM shows a
+      // fallback time but the settled scene row rebuilds with created_at:null and
+      // the timestamp disappears. Prefer any real server-supplied stamp; fall back
+      // to now only when none exists. (#5739 gate finding.)
+      created_at:raw.created_at??raw.timestamp??raw.ts??(Date.now()/1000),
       activitySegmentSeq:raw.activitySegmentSeq??raw.activity_segment_seq??_assistantSegmentSeq,
       activityBurstId:raw.activityBurstId??raw.activity_burst_id??_currentActivityBurstId,
     };
@@ -3902,6 +3909,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         status:row.status||undefined,
         stream_id:row.stream_id||streamId,
         run_id:row.run_id||streamId,
+        // Carry the row's persisted creation timestamp through hydration so the
+        // worklog event timestamp (#5700/#5739) survives a settled-snapshot rebuild
+        // (payload may not carry created_at even when the row does). (#5739 gate.)
+        created_at:payload.created_at??row.created_at??undefined,
       };
       try{
         _anchorApi.applyAssistantTurnAnchorSourceEvent(_anchorRegistry,sourceEvent,{session_id:activeSid,stream_id:streamId,run_id:streamId});

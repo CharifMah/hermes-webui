@@ -37,6 +37,7 @@ from api.config import (
     resolve_model_provider,
     resolve_custom_provider_connection,
     model_with_provider_context,
+    warm_models_catalog_provenance_if_cold,
     load_settings,
     parse_reasoning_effort,
     coerce_reasoning_effort_for_model,
@@ -7890,9 +7891,46 @@ def _run_agent_streaming(
             # Initialize SessionDB so session_search works in WebUI sessions
             _state_db_path = (Path(_profile_home) / "state.db") if _profile_home else None
             _session_db = _build_session_db_for_stream(_state_db_path)
-            resolved_model, resolved_provider, resolved_base_url = resolve_model_provider(
-                model_with_provider_context(model, provider_context)
-            )
+            # #5979: publish catalog provenance from the durable disk cache when
+            # memory is cold, so the custom-proxy resolver below sees the
+            # endpoint-advertised model ids (non-blocking, disk-only, never
+            # live-rebuilds). Both the warm and the resolve read profile-keyed
+            # config (cache path + source fingerprint via get_active_profile_name),
+            # but this streaming worker is a separate thread that does NOT inherit
+            # the HTTP handler's request-profile TLS — without binding it, a cold
+            # send from a NAMED profile would resolve against the DEFAULT profile's
+            # config and route to the wrong provider/base_url. Bind the captured
+            # owning-session profile across warm + resolve so both see the right
+            # profile (no-op for the default/root profile).
+            from api import profiles as profiles_api
+            # #5979: treat this send as a deliberate pick ONLY when the persisted
+            # explicit-pick signature matches the CURRENT model+provider routing
+            # context. Storing/comparing a signature (not a bare bool) means a
+            # later model/provider change via /api/chat/start, /api/session/update,
+            # normalization, or provider repair automatically invalidates a stale
+            # pick — so a #433 first-party leftover is never wrongly preserved on
+            # a cold catalog. Only affects the cold custom-proxy branch; warm
+            # endpoint-advertised provenance always wins over this flag.
+            from api.models import model_explicit_pick_signature as _mk_sig
+            _picked_sig = getattr(s, "model_explicit_pick_signature", None)
+            # Compare against the session's persisted model+provider — the exact
+            # fields /api/chat/start stamped the signature from (it persists the
+            # resolved model+provider onto the session before dispatch). Falls
+            # back to the worker's model/provider_context if the session fields
+            # are unset. A mismatch (any later model/provider change) yields a
+            # different signature → treated as NOT a deliberate pick.
+            _sig_model = getattr(s, "model", None) or model
+            _sig_provider = getattr(s, "model_provider", None) or provider_context
+            _current_sig = _mk_sig(_sig_model, _sig_provider)
+            _explicitly_picked = bool(_picked_sig) and _picked_sig == _current_sig
+            with profiles_api.profile_scope_for_detached_worker(
+                _resolved_profile_name, "model resolution", logger_override=logger
+            ):
+                warm_models_catalog_provenance_if_cold()
+                resolved_model, resolved_provider, resolved_base_url = resolve_model_provider(
+                    model_with_provider_context(model, provider_context),
+                    explicitly_picked=_explicitly_picked,
+                )
             configured_base_url = resolved_base_url
 
             # Resolve API key via Hermes runtime provider (matches gateway behaviour).

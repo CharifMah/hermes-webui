@@ -1,0 +1,12 @@
+# Override local Windows : monte hermes-agent sibling + active le mot de passe
+# (fusionne automatiquement avec docker-compose.yml)
+services:
+  hermes-webui:
+    volumes:
+      # Monte le depot hermes-agent clone en sibling pour que le WebUI detecte l'agent
+      - ../hermes-agent:/hermes-agent
+      # Monte le dossier PFE de l'hote pour le rendre accessible comme Space
+      - D:/Projet/ECOLE/Projet_CESI/2025-2026/PFE:/workspaces/PFE
+    environment:
+      - HERMES_WEBUI_AGENT_DIR=/hermes-agent
+      - HERMES_WEBUI_PASSWORD=${HERMES_WEBUI_PASSWORD:-hermes-local-2026}

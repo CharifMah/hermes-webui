@@ -2428,6 +2428,45 @@ document.addEventListener('click', e => {
     _openImgLightbox(img);
     return;
   }
+  // File path links — click to open in workspace preview panel
+  const filePathLink=e.target.closest('a.file-path-link[data-filepath]');
+  if(filePathLink){
+    e.preventDefault();
+    const fp=filePathLink.getAttribute('data-filepath')||'';
+    if(fp){
+      if(typeof openArtifactPath==='function'){
+        openArtifactPath(fp);
+      } else if(typeof window._workspaceOpenFile==='function'){
+        window._workspaceOpenFile(fp);
+      }
+    }
+    return;
+  }
+  // Diff viewer toggle — switch between side-by-side and unified views
+  const diffToggle=e.target.closest('.diff-toggle-btn[data-diff-id]');
+  if(diffToggle){
+    e.preventDefault();
+    const blockId=diffToggle.getAttribute('data-diff-id');
+    if(blockId){
+      const el=document.getElementById(blockId);
+      if(el){
+        const sbs=el.querySelector('.diff-sbs-view');
+        const uni=el.querySelector('.diff-unified-view');
+        if(sbs&&uni){
+          if(sbs.style.display==='none'){
+            sbs.style.display='';
+            uni.style.display='none';
+            diffToggle.textContent='⇄ Side-by-side';
+          } else {
+            sbs.style.display='none';
+            uni.style.display='';
+            diffToggle.textContent='⇄ Unified';
+          }
+        }
+      }
+    }
+    return;
+  }
 });
 
 const _IMAGE_EXTS=/\.(png|jpg|jpeg|gif|webp|bmp|ico|avif)$/i;
@@ -6775,6 +6814,181 @@ function _stripVisibleAssistantEchoFromThinking(thinkingText, ...visibleTexts){
   return clean;
 }
 
+// ── VSCode-style diff renderer ──────────────────────────────────────────────
+// Parses a unified diff and produces a side-by-side HTML view with:
+//   • File headers (--- a/file  +++ b/file)
+//   • Hunk headers (@@ -old,count +new,count @@)
+//   • Line numbers for both sides
+//   • Green/red background tints for added/removed lines
+//   • A toggle button to switch between side-by-side and unified (inline) view
+//   • Gutter line-number columns
+//
+// The diff text is already HTML-escaped by the caller (esc() runs on `code`
+// before _renderVscodeDiff is called), but we also esc() individual line
+// content here for safety since we re-split and re-process.
+function _renderVscodeDiff(rawCode, langAttr){
+  const code=rawCode.replace(/\n$/,'');
+  const lines=code.split('\n');
+
+  // Parse diff into hunks grouped by file
+  const files=[];
+  let curFile=null;
+  let curHunk=null;
+
+  for(let i=0;i<lines.length;i++){
+    const line=lines[i];
+    // File header
+    if(line.startsWith('diff --git')||line.startsWith('--- ')||line.startsWith('+++ ')){
+      if(!curFile){curFile={headers:[],hunks:[]};files.push(curFile);}
+      curFile.headers.push(line);
+      continue;
+    }
+    // Hunk header
+    const hunkMatch=line.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
+    if(hunkMatch){
+      if(!curFile){curFile={headers:[],hunks:[]};files.push(curFile);}
+      curHunk={
+        oldStart:parseInt(hunkMatch[1],10),
+        oldCount:hunkMatch[2]?parseInt(hunkMatch[2],10):1,
+        newStart:parseInt(hunkMatch[3],10),
+        newCount:hunkMatch[4]?parseInt(hunkMatch[4],10):1,
+        lines:[]
+      };
+      curFile.hunks.push(curHunk);
+      continue;
+    }
+    // Diff content lines
+    if(curHunk){
+      curHunk.lines.push(line);
+    } else if(curFile){
+      // Headers like "index abc..def" or "new file mode" etc.
+      curFile.headers.push(line);
+    } else {
+      // No file/hunk context — create a synthetic file
+      curFile={headers:[],hunks:[]};
+      files.push(curFile);
+      curHunk={oldStart:1,oldCount:0,newStart:1,newCount:0,lines:[line]};
+      curFile.hunks.push(curHunk);
+    }
+  }
+
+  // Build side-by-side and unified HTML
+  let sideBySideHtml='';
+  let unifiedHtml='';
+
+  for(const file of files){
+    // File header
+    let fileLabel='';
+    for(const h of file.headers){
+      if(h.startsWith('--- ')) fileLabel=h.replace(/^--- [ab]\//,'').replace(/^--- /,'');
+      if(h.startsWith('+++ ')) {const f2=h.replace(/^\+\+\+ [ab]\//,'').replace(/^\+\+\+ /,''); if(!fileLabel) fileLabel=f2;}
+    }
+    if(!fileLabel && file.headers.length) fileLabel=file.headers[0];
+    if(!fileLabel) fileLabel='diff';
+
+    const headerHtml=`<div class="diff-file-header">`+
+      `<span class="diff-file-name">${esc(fileLabel)}</span>`+
+      `<span class="diff-file-stats">`+
+      `<span class="diff-stat-added">+${file.hunks.reduce((a,h)=>a+h.lines.filter(l=>l.startsWith('+')&&!l.startsWith('+++')).length,0)}</span>`+
+      ` <span class="diff-stat-removed">-${file.hunks.reduce((a,h)=>a+h.lines.filter(l=>l.startsWith('-')&&!l.startsWith('---')).length,0)}</span>`+
+      `</span></div>`;
+
+    sideBySideHtml+=headerHtml;
+    unifiedHtml+=headerHtml;
+
+    for(const hunk of file.hunks){
+      // Build paired rows for side-by-side
+      const oldLines=[];
+      const newLines=[];
+      let oldLn=hunk.oldStart;
+      let newLn=hunk.newStart;
+
+      for(const line of hunk.lines){
+        const content=esc(line.length>1?line.slice(1):'');
+        if(line.startsWith('+')){
+          newLines.push({num:newLn++,content,type:'plus'});
+          oldLines.push({num:'',content:'',type:'empty'});
+        } else if(line.startsWith('-')){
+          oldLines.push({num:oldLn++,content,type:'minus'});
+          newLines.push({num:'',content:'',type:'empty'});
+        } else if(line.startsWith('\\')){
+          // "\\ No newline at end of file" — meta line
+          oldLines.push({num:'',content:content,type:'meta'});
+          newLines.push({num:'',content:content,type:'meta'});
+        } else {
+          const ctxContent=esc(line.replace(/^ /,''));
+          oldLines.push({num:oldLn++,content:ctxContent,type:'ctx'});
+          newLines.push({num:newLn++,content:ctxContent,type:'ctx'});
+        }
+      }
+
+      // Hunk header
+      const hunkHeaderHtml=`<div class="diff-hunk-header">${esc('@@ -'+hunk.oldStart+','+hunk.oldCount+' +'+hunk.newStart+','+hunk.newCount+' @@')}</div>`;
+      sideBySideHtml+=hunkHeaderHtml;
+      unifiedHtml+=hunkHeaderHtml;
+
+      // Side-by-side table
+      sideBySideHtml+='<div class="diff-sbs-body">';
+      for(let i=0;i<oldLines.length;i++){
+        const o=oldLines[i];
+        const n=newLines[i];
+        sideBySideHtml+=
+          `<div class="diff-sbs-row ${o.type}">`+
+            `<div class="diff-sbs-side diff-sbs-old ${o.type}">`+
+              `<span class="diff-ln">${o.num}</span>`+
+              `<span class="diff-content">${o.content}</span>`+
+            `</div>`+
+            `<div class="diff-sbs-side diff-sbs-new ${n.type}">`+
+              `<span class="diff-ln">${n.num}</span>`+
+              `<span class="diff-content">${n.content}</span>`+
+            `</div>`+
+          `</div>`;
+      }
+      sideBySideHtml+='</div>';
+
+      // Unified view
+      unifiedHtml+='<div class="diff-unified-body">';
+      oldLn=hunk.oldStart;
+      newLn=hunk.newStart;
+      for(const line of hunk.lines){
+        const content=esc(line.length>1?line.slice(1):'');
+        const rawContent=esc(line.replace(/^[-+ ]/,''));
+        let type='ctx', ln1='', ln2='';
+        if(line.startsWith('+')){
+          type='plus'; ln2=newLn++;
+        } else if(line.startsWith('-')){
+          type='minus'; ln1=oldLn++;
+        } else if(line.startsWith('\\')){
+          type='meta';
+        } else {
+          ln1=oldLn++; ln2=newLn++;
+        }
+        unifiedHtml+=
+          `<div class="diff-unified-row ${type}">`+
+            `<span class="diff-ln diff-ln-old">${ln1}</span>`+
+            `<span class="diff-ln diff-ln-new">${ln2}</span>`+
+            `<span class="diff-sign">${line.startsWith('+')?'+':line.startsWith('-')?'-':line.startsWith('\\')?'\\':' '}</span>`+
+            `<span class="diff-content">${type==='meta'?content:rawContent}</span>`+
+          `</div>`;
+      }
+      unifiedHtml+='</div>';
+    }
+  }
+
+  // Generate unique ID for this diff block
+  const blockId='diff-'+Math.random().toString(36).slice(2,10);
+
+  // Build the container with toggle
+  let html=`<div class="diff-viewer" id="${blockId}">`;
+  html+=`<div class="diff-toolbar">`;
+  html+=`<button type="button" class="diff-toggle-btn" data-diff-id="${blockId}" data-mode="sbs">⇄ Side-by-side</button>`;
+  html+=`</div>`;
+  html+=`<div class="diff-sbs-view">${sideBySideHtml}</div>`;
+  html+=`<div class="diff-unified-view" style="display:none">${unifiedHtml}</div>`;
+  html+=`</div>`;
+  return html;
+}
+
 function renderMd(raw){
   let s=(raw||'').replace(/\r\n/g,'\n').replace(/\r/g,'\n');
   // ── Entity decode: must run FIRST so &gt; lines become > for the blockquote
@@ -6895,15 +7109,11 @@ function renderMd(raw){
       const h=lang?`<div class="pre-header">${esc(lang)}</div>`:'';
       const langAttr=lang?` class="language-${esc(lang)}"`:'';
       const preClass=/^(md|markdown|mdx)$/.test(lang)?' class="md-source-block"':'';
-      // For diff/patch blocks, wrap each line in a colored span
+      // For diff/patch blocks, render a VSCode-style diff viewer with
+      // side-by-side panels, line numbers, file headers, and a toggle.
       if(lang==='diff'||lang==='patch'){
-        const colored=esc(code.replace(/\n$/,'')).split('\n').map(line=>{
-          if(line.startsWith('@@')) return `<span class="diff-line diff-hunk">${line}</span>`;
-          if(line.startsWith('+')) return `<span class="diff-line diff-plus">${line}</span>`;
-          if(line.startsWith('-')) return `<span class="diff-line diff-minus">${line}</span>`;
-          return `<span class="diff-line">${line}</span>`;
-        }).join('\n');
-        _preBlock_stash.push(`${h}<pre class="diff-block"><code${langAttr}>${colored}</code></pre>`);
+        const diffHtml=_renderVscodeDiff(code,langAttr);
+        _preBlock_stash.push(`${h}${diffHtml}`);
       // For JSON/YAML blocks, add tree-view placeholder with raw data
       } else if(lang==='json'||lang==='yaml'){
         const rawCode=esc(code.replace(/\n$/,''));
@@ -7018,7 +7228,7 @@ function renderMd(raw){
     // Stash [label](url) links before autolink so the URL in href= is not re-linked
     const _link_stash=[];
     t=t.replace(/\[([^\]]+)\]\(((?:https?:\/\/|file:\/\/|workspace:\/\/|session:\/\/|mailto:|tel:|message:)[^\s\)]+)\)/g,(_,lb,u)=>{_link_stash.push(_markdownAnchor(lb,u));return `\x00L${_link_stash.length-1}\x00`;});
-    t=t.replace(/(https?:\/\/[^\s<>"')\]]+)/g,(url)=>{const trail=url.match(/[.,;:!?)]$/)?url.slice(-1):'';const clean=trail?url.slice(0,-1):url;return `<a href="${clean}" target="_blank" rel="noopener">${esc(clean)}</a>${trail}`;});
+    t=t.replace(/(https?:\/\/[^\s<>"'\)\]]+)/g,(url)=>{const trail=url.match(/[.,;:!?)]$/)?url.slice(-1):'';const clean=trail?url.slice(0,-1):url;if(_IMAGE_EXTS.test(clean.split('?')[0].split('#')[0])){return `<img src="${clean.replace(/"/g,'%22')}" alt="${esc(clean)}" class="msg-media-img" loading="lazy">${trail}`;}return `<a href="${clean}" target="_blank" rel="noopener">${esc(clean)}</a>${trail}`;});
     t=t.replace(/\x00L(\d+)\x00/g,(_,i)=>_link_stash[+i]);
     t=t.replace(/\x00G(\d+)\x00/g,(_,i)=>_img_stash[+i]);
     // Escape any plain text that isn't already wrapped in a tag we produced
@@ -7291,12 +7501,13 @@ function renderMd(raw){
       return `<div${cls}${mermaid}${katex}>`;
     }
     if(name==='a'){
-      if(!_isSafeUrl(a.href,false)) return '<a>';
+      if(!_isSafeUrl(a.href,false)&&a.href!=='#') return '<a>';
       const target=a.target==='_blank'?' target="_blank"':'';
       const rel=a.rel==='noopener'?' rel="noopener"':'';
-      const cls=_cls(a.class,['msg-media-link','skill-linked-file','skill-file-back','session-link']);
+      const cls=_cls(a.class,['msg-media-link','skill-linked-file','skill-file-back','session-link','file-path-link']);
       const download=a.download?` download="${esc(a.download)}"`:'';
-      return `<a${cls} href="${esc(_safeAttrValue(a.href))}"${target}${rel}${download}>`;
+      const filepath=a['data-filepath']?` data-filepath="${esc(a['data-filepath'])}"`:'';
+      return `<a${cls} href="${esc(_safeAttrValue(a.href))}"${target}${rel}${download}${filepath}>`;
     }
     if(name==='img'){
       if(!_isSafeUrl(a.src,true)) return '';
@@ -7320,9 +7531,37 @@ function renderMd(raw){
     // Strip trailing punctuation that was likely not part of the URL
     const trail=url.match(/[.,;:!?)]$/)?url.slice(-1):'';
     const clean=trail?url.slice(0,-1):url;
+    // If URL points to an image, render inline preview instead of a plain link
+    if(_IMAGE_EXTS.test(clean.split('?')[0].split('#')[0])){
+      return `<img src="${clean.replace(/"/g,'%22')}" alt="${esc(clean)}" class="msg-media-img" loading="lazy">${trail}`;
+    }
     return `<a href="${clean}" target="_blank" rel="noopener">${esc(clean)}</a>${trail}`;
   });
   s=s.replace(/\x00B(\d+)\x00/g,(_,i)=>_al_stash[+i]);
+  // ── File path linkifier ──────────────────────────────────────────────────
+  // Detect bare file paths in the text and turn them into clickable links.
+  // Matches:
+  //   • Absolute paths: /foo/bar.txt, C:\foo\bar.txt
+  //   • Relative paths with extensions: ./src/file.js, ../lib/utils.py
+  //   • Home paths: ~/config/file.yaml
+  // Paths inside <a>, <img>, <pre>, <code> are already stashed/linked and won't match.
+  // Image paths get inline preview via the /api/media system.
+  // Uses data-filepath + event delegation (not inline onclick) for safety.
+  const _path_stash=[];
+  s=s.replace(/(<a\b[^>]*>[\s\S]*?<\/a>|<img\b[^>]*>|<pre\b[^>]*>[\s\S]*?<\/pre>|<code\b[^>]*>[^<]*<\/code>)/g,m=>{_path_stash.push(m);return `\x00K${_path_stash.length-1}\x00`;});
+  s=s.replace(/(^|[^\w\/])((?:\/[\w\-./]+|[A-Za-z]:\\[\w\-.\s\\]+|~\/[\w\-./]+|\.{0,2}\/[\w\-./]+)\.[a-zA-Z][a-zA-Z0-9]{0,4})(?=[\s,;:!?\)\]\}]|$)/g,(m,pre,path)=>{
+    const cleanPath=path;
+    const ext=cleanPath.split('.').pop().toLowerCase();
+    // Image paths → inline preview using /api/media
+    if(_IMAGE_EXTS.test('.'+ext)){
+      const sid=(typeof S!=='undefined'&&S&&S.session&&S.session.session_id)?S.session.session_id:'';
+      const mediaUrl='api/media?path='+encodeURIComponent(cleanPath)+(sid?'&session_id='+encodeURIComponent(sid):'');
+      return pre+`<img src="${mediaUrl}" alt="${esc(cleanPath)}" class="msg-media-img" loading="lazy">`;
+    }
+    // Non-image paths → clickable link with data-filepath (event delegation handles clicks)
+    return pre+`<a href="#" class="file-path-link" data-filepath="${esc(cleanPath)}">${esc(cleanPath)}</a>`;
+  });
+  s=s.replace(/\x00K(\d+)\x00/g,(_,i)=>_path_stash[+i]);
   // Restore math stash → katex placeholder spans/divs
   // These will be rendered by renderKatexBlocks() after DOM insertion
   s=s.replace(/\x00M(\d+)\x00/g,(_,i)=>{
@@ -7350,7 +7589,7 @@ function renderMd(raw){
   // fix targeted the wrong layer (Prism token white-space) — by the time it
   // ran, the \n had already been replaced. The CSS rule is kept as defense
   // in depth.
-  s=s.replace(/(<div class="pre-header">[\s\S]*?<\/div>)?<pre[^>]*>[\s\S]*?<\/pre>|<div class="(mermaid-block|katex-block)"[\s\S]*?<\/div>/g,m=>{
+  s=s.replace(/(<div class="pre-header">[\s\S]*?<\/div>)?<pre[^>]*>[\s\S]*?<\/pre>|<div class="(mermaid-block|katex-block|diff-viewer)"[\s\S]*?<\/div>/g,m=>{
     _pre_stash.push(m);
     return '\x00E'+(_pre_stash.length-1)+'\x00';
   });

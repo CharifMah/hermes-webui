@@ -781,9 +781,13 @@ async function _refreshGitBadge(){
       badge.textContent=text;
       badge.className='git-badge'+(g.dirty>0?' dirty':'');
       badge.style.display='';
+      badge.onclick=toggleGitChangesPanel;
+      badge.title='Click to see changed files';
     } else {
       badge.style.display='none';
       badge.textContent='';
+      const panel=$('gitChangesPanel');
+      if(panel) panel.style.display='none';
     }
   }catch(e){
     if(!S.session||S.session.session_id!==sessionId)return;

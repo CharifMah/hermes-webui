@@ -10095,26 +10095,40 @@ S.openTabs = S.openTabs || {}; // sid -> {title}
 function renderChatTabs(){
   const bar=document.getElementById('chatTabs');
   if(!bar)return;
-  const sids=Object.keys(S.openTabs);
-  if(!sids.length){
+  const tabIds=Object.keys(S.openTabs);
+  if(!tabIds.length){
     bar.style.display='none';
     return;
   }
   bar.style.display='flex';
   const activeSid=S.session?S.session.session_id:null;
   let html='';
-  for(const sid of sids){
-    const tab=S.openTabs[sid];
-    const isActive=sid===activeSid;
+  for(const tabId of tabIds){
+    const tab=S.openTabs[tabId];
+    const isFile=tab.type==='file';
+    const isActive=isFile?S.activeTab===tabId:tabId===activeSid;
     const title=tab.title||'Untitled';
-    html+=`<div class="chat-tab${isActive?' active':''}" onclick="switchToTab('${sid}')" title="${esc(title)}">`;
+    const icon=isFile?'<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;opacity:.6"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg> ':'';
+    const onclick=isFile?`switchToFileTab('${tabId}')`:`switchToTab('${tabId}')`;
+    html+=`<div class="chat-tab${isActive?' active':''}" onclick="${onclick}" title="${esc(title)}">`;
+    html+=icon;
     html+=`<span class="chat-tab-label">${esc(title)}</span>`;
-    html+=`<span class="chat-tab-close" onclick="event.stopPropagation();closeChatTab('${sid}')"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></span>`;
+    html+=`<span class="chat-tab-close" onclick="event.stopPropagation();closeChatTab('${tabId}')"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></span>`;
     html+='</div>';
   }
   // + button to start new chat
   html+=`<div class="chat-tab-add" onclick="startNewChatFromTab()" title="New chat"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></div>`;
   bar.innerHTML=html;
+}
+
+function switchToFileTab(tabId){
+  const tab=S.openTabs[tabId];
+  if(!tab||tab.type!=='file')return;
+  S.activeTab=tabId;
+  renderChatTabs();
+  if(tab.path&&typeof openArtifactPath==='function'){
+    openArtifactPath(tab.path);
+  }
 }
 
 function addChatTab(sid,title){
@@ -19166,6 +19180,82 @@ function _wsDragSrcType(e){
   if(custom) return custom;
   return _wsActiveDragType||'file';
 }
+
+// ── Drag-and-drop workspace files onto main chat area → create file tab ──
+function _initMainChatWsDrop(){
+  if(typeof document==='undefined')return;
+  const init=()=>{
+    const mainChat=document.getElementById('mainChat');
+    const chatTabs=document.getElementById('chatTabs');
+    if(!mainChat)return;
+    // Drop on the tab bar — add file as a new tab
+    if(chatTabs&&!chatTabs._wsDropBound){
+      chatTabs._wsDropBound=true;
+      chatTabs.addEventListener('dragover',(e)=>{
+        if(!_isWorkspaceTreeMoveDrag(e))return;
+        const type=_wsDragSrcType(e);
+        if(type==='dir'||type==='directory')return; // don't open dirs as tabs
+        e.preventDefault();e.stopPropagation();
+        e.dataTransfer.dropEffect='copy';
+        chatTabs.classList.add('chat-tabs-drag-over');
+      });
+      chatTabs.addEventListener('dragleave',()=>{
+        chatTabs.classList.remove('chat-tabs-drag-over');
+      });
+      chatTabs.addEventListener('drop',(e)=>{
+        if(!_isWorkspaceTreeMoveDrag(e))return;
+        const type=_wsDragSrcType(e);
+        if(type==='dir'||type==='directory')return;
+        e.preventDefault();e.stopPropagation();
+        chatTabs.classList.remove('chat-tabs-drag-over');
+        const path=_wsDragSrcPath(e);
+        if(!path)return;
+        // Add a file tab and switch to it
+        const tabId='file:'+path;
+        S.openTabs[tabId]={type:'file',title:path.split('/').pop()||path,path:path};
+        renderChatTabs();
+        // Open the file in the preview area
+        if(typeof openArtifactPath==='function'){
+          openArtifactPath(path);
+        }
+      });
+    }
+    // Drop on the main chat area (messages zone) — also creates a file tab
+    if(!mainChat._wsDropBound){
+      mainChat._wsDropBound=true;
+      mainChat.addEventListener('dragover',(e)=>{
+        if(!_isWorkspaceTreeMoveDrag(e))return;
+        const type=_wsDragSrcType(e);
+        if(type==='dir'||type==='directory')return;
+        // Only intercept if dropping on the messages area (not the composer)
+        const target=e.target;
+        if(target&&target.closest&&target.closest('#msgInner,.messages,.empty-state,#chatTabs')) {
+          e.preventDefault();e.stopPropagation();
+          e.dataTransfer.dropEffect='copy';
+        }
+      });
+      mainChat.addEventListener('drop',(e)=>{
+        if(!_isWorkspaceTreeMoveDrag(e))return;
+        const type=_wsDragSrcType(e);
+        if(type==='dir'||type==='directory')return;
+        const target=e.target;
+        if(!target||!target.closest||!target.closest('#msgInner,.messages,.empty-state,#chatTabs'))return;
+        e.preventDefault();e.stopPropagation();
+        const path=_wsDragSrcPath(e);
+        if(!path)return;
+        const tabId='file:'+path;
+        S.openTabs[tabId]={type:'file',title:path.split('/').pop()||path,path:path};
+        renderChatTabs();
+        if(typeof openArtifactPath==='function'){
+          openArtifactPath(path);
+        }
+      });
+    }
+  };
+  if(document.readyState==='complete'||document.readyState==='interactive'){init();}
+  else{document.addEventListener('DOMContentLoaded',init,{once:true});}
+}
+_initMainChatWsDrop();
 
 function _workspaceParentDir(relPath){
   if(!relPath||relPath==='.')return '.';

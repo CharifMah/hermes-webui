@@ -795,6 +795,168 @@ async function _refreshGitBadge(){
   }
 }
 
+function toggleGitChangesPanel(){
+  if(typeof switchPanel==='function') switchPanel('git');
+}
+
+async function _loadGitChangesDetail(){
+  if(!S.session) return;
+  var content=$('gitPanelContent');
+  if(!content) return;
+  content.innerHTML='<div style="padding:12px;color:var(--muted);font-size:12px">Loading...</div>';
+  var sessionId=S.session.session_id;
+  try{
+    var data=await api('/api/git/status?session_id='+encodeURIComponent(sessionId));
+    if(!S.session||S.session.session_id!==sessionId) return;
+    var git=data.git||data;
+    if(!git||!git.is_git){
+      content.innerHTML='<div style="padding:12px;color:var(--muted);font-size:12px">Not a git repository.</div>';
+      return;
+    }
+    _renderGitChangesBody(content, git);
+  }catch(e){
+    content.innerHTML='<div style="padding:12px;color:var(--error,#e05);font-size:12px">'+(e&&e.message?e.message:'Failed to load git status.')+'</div>';
+  }
+}
+
+function _gitStatusLetter(file){
+  if(file.untracked) return 'U';
+  if(file.conflict) return 'C';
+  if(file.staged && file.unstaged) return 'M';
+  if(file.staged) return 'S';
+  if(file.unstaged) return 'M';
+  return '?';
+}
+
+function _gitStatusClass(file){
+  if(file.untracked) return 'git-status-modified';
+  if(file.conflict) return 'git-status-deleted';
+  if(file.staged) return 'git-status-added';
+  return 'git-status-modified';
+}
+
+function _renderGitChangesBody(container, git){
+  var branch=git.branch||'HEAD';
+  var ahead=git.ahead||0;
+  var behind=git.behind||0;
+  var files=git.files||[];
+
+  var html='';
+  // Branch header
+  html+='<div class="git-sidebar-branch">';
+  html+='<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>';
+  html+='<span class="git-sidebar-branch-name">'+_escHtml(branch)+'</span>';
+  if(ahead>0) html+='<span class="git-sidebar-ahead" title="ahead by '+ahead+'">\u2191'+ahead+'</span>';
+  if(behind>0) html+='<span class="git-sidebar-behind" title="behind by '+behind+'">\u2193'+behind+'</span>';
+  html+='</div>';
+
+  // Action buttons
+  html+='<div class="git-sidebar-actions">';
+  html+='<button class="git-action-btn" onclick="gitAction(\'fetch\')" title="Fetch from remote"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 1-9 9 9 9 0 0 1-9-9 9 9 0 0 1 9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg> Fetch</button>';
+  html+='<button class="git-action-btn" onclick="gitAction(\'pull\')" title="Pull from remote"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 9-9 9 9 0 0 1 9 9 9 9 0 0 1-9 9c-2.52 0-4.93-1-6.74-2.74L3 16"/><path d="M3 21v-5h5"/></svg> Pull</button>';
+  html+='<button class="git-action-btn git-action-push" onclick="gitAction(\'push\')" title="Push to remote"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg> Push</button>';
+  html+='</div>';
+
+  // Group files by Staged / Modified / Untracked
+  var staged=[], modified=[], untracked=[];
+  for(var i=0;i<files.length;i++){
+    var f=files[i];
+    if(f.untracked) untracked.push(f);
+    else if(f.staged) staged.push(f);
+    else if(f.unstaged) modified.push(f);
+  }
+
+  function renderSection(label, items){
+    if(!items.length) return '';
+    var s='<div class="git-section"><div class="git-section-label">'+_escHtml(label)+' ('+items.length+')</div>';
+    for(var j=0;j<items.length;j++){
+      var file=items[j];
+      var path=_escHtml(file.path||'');
+      var letter=_gitStatusLetter(file);
+      var cls=_gitStatusClass(file);
+      s+='<div class="git-file-row" onclick="openGitFileDiff(\''+path.replace(/'/g,'\\\'')+'\')">';
+      s+='<span class="git-file-status '+cls+'">'+letter+'</span>';
+      s+='<span class="git-file-path" title="'+path+'">'+path+'</span>';
+      if(file.additions!=null||file.deletions!=null){
+        s+='<span class="git-file-stats">+'+(file.additions||0)+' <span class="git-del">-'+(file.deletions||0)+'</span></span>';
+      }
+      s+='</div>';
+    }
+    s+='</div>';
+    return s;
+  }
+
+  html+=renderSection('Staged', staged);
+  html+=renderSection('Modified', modified);
+  html+=renderSection('Untracked', untracked);
+
+  if(!files.length){
+    html+='<div style="padding:12px;color:var(--muted);font-size:12px;text-align:center">No changes.</div>';
+  }
+
+  container.innerHTML=html;
+}
+
+async function openGitFileDiff(path){
+  if(!path||!S.session) return;
+  var content=$('gitPanelContent');
+  if(!content) return;
+  var diffEl=content.querySelector('.git-diff-overlay');
+  if(!diffEl){
+    diffEl=document.createElement('div');
+    diffEl.className='git-diff-overlay';
+    content.parentElement.appendChild(diffEl);
+  }
+  diffEl.style.display='flex';
+  diffEl.innerHTML='<div class="git-diff-header"><span>'+_escHtml(path)+'</span><button class="git-diff-close" onclick="this.closest(\'.git-diff-overlay\').style.display=\'none\'"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div><div class="git-diff-body"><div style="padding:12px;color:var(--muted);font-size:12px">Loading diff...</div></div>';
+  var sessionId=S.session.session_id;
+  try{
+    var data=await api('/api/git/diff?session_id='+encodeURIComponent(sessionId)+'&path='+encodeURIComponent(path)+'&kind=unstaged');
+    if(!S.session||S.session.session_id!==sessionId) return;
+    var diff=(data&&data.diff)||data;
+    var bodyEl=diffEl.querySelector('.git-diff-body');
+    if(diff&&diff.binary){
+      bodyEl.innerHTML='<div style="padding:12px;color:var(--muted);font-size:12px">Binary file — no text diff.</div>';
+    }else if(diff&&diff.diff){
+      _renderVscodeDiff(bodyEl, diff.diff, path);
+    }else{
+      bodyEl.innerHTML='<div style="padding:12px;color:var(--muted);font-size:12px">No changes.</div>';
+    }
+  }catch(e){
+    var bodyErr=diffEl.querySelector('.git-diff-body');
+    if(bodyErr) bodyErr.innerHTML='<div style="padding:12px;color:var(--error,#e05);font-size:12px">'+_escHtml(e&&e.message?e.message:'Failed to load diff.')+'</div>';
+  }
+}
+
+function _renderVscodeDiff(container, diffText, path){
+  if(!container||!diffText) return;
+  var lines=String(diffText).split('\n');
+  var html='<pre class="diff-block"><code>';
+  for(var i=0;i<lines.length;i++){
+    var line=_escHtml(lines[i]);
+    if(line.startsWith('@@')) html+='<span class="diff-line diff-hunk">'+line+'</span>';
+    else if(line.startsWith('+')) html+='<span class="diff-line diff-plus">'+line+'</span>';
+    else if(line.startsWith('-')) html+='<span class="diff-line diff-minus">'+line+'</span>';
+    else html+='<span class="diff-line">'+line+'</span>';
+    if(i<lines.length-1) html+='\n';
+  }
+  html+='</code></pre>';
+  container.innerHTML=html;
+}
+
+async function gitAction(action){
+  if(!S.session||!action) return;
+  if(typeof showToast==='function') showToast(action.charAt(0).toUpperCase()+action.slice(1)+'ing...',2000);
+  try{
+    await api('/api/git/'+action,{method:'POST',body:JSON.stringify({session_id:S.session.session_id})});
+    if(typeof showToast==='function') showToast(action.charAt(0).toUpperCase()+action.slice(1)+' complete.',2000,'success');
+    _loadGitChangesDetail();
+    _refreshGitBadge();
+  }catch(e){
+    if(typeof showToast==='function') showToast((e&&e.message?e.message:action+' failed.'),5000,'error');
+  }
+}
+
 function navigateUp(){
   if(!S.session||S.currentDir==='.')return;
   const parts=S.currentDir.split('/');

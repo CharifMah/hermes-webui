@@ -107,8 +107,8 @@ def test_pre_stash_still_captures_pre_header_and_optional_div():
         "Optional <div class=\"pre-header\"> prefix must still precede the "
         "<pre[^>]*> match"
     )
-    assert '<div class="(mermaid-block|katex-block|diff-viewer)"' in pre_stash_block, (
-        "Mermaid/katex/diff-viewer block alternation must remain in the regex"
+    assert '<div class="(mermaid-block|katex-block)"' in pre_stash_block, (
+        "Mermaid/katex block alternation must remain in the regex"
     )
 
 
@@ -147,7 +147,6 @@ function extractFunc(name) {
 }
 eval(extractFunc('_matchBacktickFenceLine'));
 eval(extractFunc('_isBacktickFenceClose'));
-eval(extractFunc('_renderVscodeDiff'));
 eval(extractFunc('renderMd'));
 
 let buf = '';
@@ -241,18 +240,18 @@ def test_json_block_preserves_newlines(driver_path):
 
 @pytestmark_node
 def test_diff_block_preserves_newlines(driver_path):
-    """Diff/patch blocks emit a <div class="diff-viewer"> with side-by-side rows.
-    Newlines inside the diff content must survive (no <br> corruption)."""
+    """Diff/patch blocks emit <pre class=\"diff-block\"> (static/ui.js:1619).
+    Same regex-miss shape as YAML/JSON. Newlines must survive."""
     md = "```diff\n-removed line\n+added line\n unchanged\n```"
     out = _render(driver_path, md)
 
-    assert "diff-viewer" in out
-    # The diff-viewer renders rows as <div> elements, not <pre> — verify
-    # the content is structurally intact without <br> corruption.
-    assert "<br>" not in out.split('diff-viewer')[1].split('</div>\n</div>')[0] if 'diff-viewer' in out else True
-    assert "removed line" in out
-    assert "added line" in out
-    assert "unchanged" in out
+    assert "diff-block" in out
+    pre_inner = _extract_pre_inner(out)
+    assert pre_inner
+    assert "\n" in pre_inner, (
+        f"Diff <pre> block lost newlines.  Inner: {pre_inner!r}"
+    )
+    assert "<br>" not in pre_inner
 
 
 @pytestmark_node

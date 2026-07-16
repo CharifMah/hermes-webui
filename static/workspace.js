@@ -781,13 +781,268 @@ async function _refreshGitBadge(){
       badge.textContent=text;
       badge.className='git-badge'+(g.dirty>0?' dirty':'');
       badge.style.display='';
+      badge.onclick=toggleGitChangesPanel;
+      badge.title='Click to see changed files';
     } else {
       badge.style.display='none';
       badge.textContent='';
     }
+    // Also update the collapsible git changes panel above chat
+    if(data.git&&data.git.is_git){
+      _updateGitChangesPanel(data.git);
+    }else{
+      const gcp=document.getElementById('gitChangesPanel');
+      if(gcp) gcp.style.display='none';
+    }
   }catch(e){
     if(!S.session||S.session.session_id!==sessionId)return;
     badge.style.display='none';
+  }
+}
+
+// ── Git panel: show branch + changed files (VSCode Source Control style) ──
+let _gitPanelLoading=false;
+let _gitPanelLastData=null;
+
+async function loadGitPanel(){
+  if(!S.session||_gitPanelLoading)return;
+  const panel=$('workspaceGitPanel');
+  if(!panel)return;
+  _gitPanelLoading=true;
+  const sessionId=S.session.session_id;
+  try{
+    const data=await api(`/api/workspace/git/status?session_id=${encodeURIComponent(sessionId)}`);
+    if(!S.session||S.session.session_id!==sessionId)return;
+    _gitPanelLastData=data.git||data;
+    _renderGitPanel(panel,_gitPanelLastData);
+    _updateGitTabBadge(_gitPanelLastData);
+  }catch(e){
+    if(!S.session||S.session.session_id!==sessionId)return;
+    panel.innerHTML='<div class="git-panel-empty">Git status unavailable</div>';
+  }finally{
+    _gitPanelLoading=false;
+  }
+}
+
+function _updateGitTabBadge(git){
+  const count=$('workspaceGitCount');
+  if(!count)return;
+  const changed=git&&git.totals?git.totals.changed:0;
+  if(changed>0){
+    count.textContent=changed;
+    count.style.display='';
+  }else{
+    count.style.display='none';
+  }
+}
+
+function _renderGitPanel(panel,git){
+  if(!git||!git.is_git){
+    panel.innerHTML='<div class="git-panel-empty">Not a git repository</div>';
+    return;
+  }
+  let html='';
+  // Branch header
+  html+='<div class="git-panel-header">';
+  html+=`<span class="git-panel-branch"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg> ${esc(git.branch||'HEAD')}</span>`;
+  if(git.ahead>0||git.behind>0){
+    html+=`<span class="git-panel-ahead-behind">`;
+    if(git.ahead>0)html+=`<span class="git-ahead">↑${git.ahead}</span> `;
+    if(git.behind>0)html+=`<span class="git-behind">↓${git.behind}</span>`;
+    html+=`</span>`;
+  }
+  html+='</div>';
+
+  const files=git.files||[];
+  if(!files.length){
+    html+='<div class="git-panel-empty">No changes — working tree clean</div>';
+    panel.innerHTML=html;
+    return;
+  }
+
+  // Group: staged, unstaged (modified), untracked
+  const staged=files.filter(f=>f.staged&&!f.untracked);
+  const modified=files.filter(f=>f.unstaged&&!f.staged&&!f.untracked);
+  const untracked=files.filter(f=>f.untracked);
+  const conflicts=files.filter(f=>f.conflict);
+
+  function _fileRow(f){
+    const status=f.status||'M';
+    const statusCls=status==='?'?'git-status-untracked':status==='A'?'git-status-added':status==='D'?'git-status-deleted':status==='R'?'git-status-renamed':'git-status-modified';
+    const stats=f.additions!==undefined&&f.deletions!==undefined?`<span class="git-file-stats"><span class="git-stat-add">+${f.additions}</span> <span class="git-stat-del">-${f.deletions}</span></span>`:'';
+    return `<div class="git-file-row" onclick="openGitFileDiff('${esc(f.path)}','${f.staged?'staged':'unstaged'}')" title="Click to view diff">`+
+      `<span class="git-file-status ${statusCls}">${status}</span>`+
+      `<span class="git-file-name">${esc(f.path)}</span>`+
+      stats+
+      `</div>`;
+  }
+
+  function _section(label,items){
+    if(!items.length)return '';
+    return `<div class="git-section"><div class="git-section-label">${label} (${items.length})</div>${items.map(_fileRow).join('')}</div>`;
+  }
+
+  html+=_section('Staged',staged);
+  html+=_section('Modified',modified);
+  html+=_section('Untracked',untracked);
+  if(conflicts.length)html+=_section('Conflicts',conflicts);
+
+  if(git.truncated)html+='<div class="git-panel-truncated">Showing first '+files.length+' files</div>';
+
+  panel.innerHTML=html;
+}
+
+async function openGitFileDiff(path,kind){
+  if(!S.session)return;
+  const sessionId=S.session.session_id;
+  try{
+    const data=await api(`/api/workspace/git/diff?session_id=${encodeURIComponent(sessionId)}&path=${encodeURIComponent(path)}&kind=${kind}`);
+    if(!S.session||S.session.session_id!==sessionId)return;
+    const diff=data.diff||'';
+    if(!diff.trim()){
+      showToast('No diff available for '+path,3000);
+      return;
+    }
+    // Show diff in preview area using the diff viewer
+    const pa=$('previewArea');
+    const pp=$('previewPathText');
+    if(pp)pp.textContent=path+' (diff)';
+    if(pa){
+      pa.classList.add('visible');
+      // Hide other preview elements
+      const pi=$('previewImg');if(pi)pi.style.display='none';
+      const pdf=$('previewPdfFrame');if(pdf)pdf.style.display='none';
+      const html=$('previewHtmlIframe');if(html)html.style.display='none';
+      const pm=$('previewMd');if(pm)pm.style.display='none';
+      const pc=$('previewCode');if(pc)pc.style.display='none';
+      // Render diff in a custom container
+      let diffContainer=$('previewGitDiff');
+      if(!diffContainer){
+        diffContainer=document.createElement('div');
+        diffContainer.id='previewGitDiff';
+        diffContainer.className='preview-git-diff';
+        pa.appendChild(diffContainer);
+      }
+      diffContainer.style.display='block';
+      // Use the VSCode-style diff renderer from ui.js
+      if(typeof _renderVscodeDiff==='function'){
+        diffContainer.innerHTML='<div class="pre-header">diff</div>'+_renderVscodeDiff(diff,'');
+      }else{
+        diffContainer.innerHTML='<pre class="diff-block"><code>'+esc(diff)+'</code></pre>';
+      }
+    }
+  }catch(e){
+    showToast('Failed to load diff: '+(e.message||e),3000);
+  }
+}
+
+function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
+
+// ── Collapsible git changes panel above chat ──
+let _gitChangesExpanded=false;
+let _gitChangesFullData=null;
+
+function toggleGitChangesPanel(){
+  const panel=document.getElementById('gitChangesPanel');
+  if(!panel)return;
+  if(panel.style.display==='none'){
+    panel.style.display='flex';
+    _gitChangesExpanded=true;
+    // Fetch full status with file list
+    _loadGitChangesDetail();
+  }else{
+    panel.style.display='none';
+    _gitChangesExpanded=false;
+  }
+}
+
+function _updateGitChangesPanel(git){
+  // Update badge count on the git badge in workspace panel
+  const branch=document.getElementById('gitChangesBranch');
+  const count=document.getElementById('gitChangesCount');
+  if(branch) branch.textContent=git.branch||'HEAD';
+  const changed=git.dirty||0;
+  if(count){
+    count.textContent=changed;
+    count.style.display=changed>0?'':'none';
+  }
+}
+
+async function _loadGitChangesDetail(){
+  if(!S.session)return;
+  const sessionId=S.session.session_id;
+  const body=document.getElementById('gitChangesBody');
+  if(!body)return;
+  body.innerHTML='<div class="git-panel-empty">Loading...</div>';
+  try{
+    const data=await api(`/api/workspace/git/status?session_id=${encodeURIComponent(sessionId)}`);
+    if(!S.session||S.session.session_id!==sessionId)return;
+    const git=data.git||data;
+    _gitChangesFullData=git;
+    _renderGitChangesBody(body,git);
+  }catch(e){
+    body.innerHTML='<div class="git-panel-empty">Git status unavailable</div>';
+  }
+}
+
+function _renderGitChangesBody(body,git){
+  if(!git||!git.is_git){
+    body.innerHTML='<div class="git-panel-empty">Not a git repository</div>';
+    return;
+  }
+  const files=git.files||[];
+  if(!files.length){
+    body.innerHTML='<div class="git-panel-empty">No changes — working tree clean</div>';
+    return;
+  }
+  const staged=files.filter(f=>f.staged&&!f.untracked);
+  const modified=files.filter(f=>f.unstaged&&!f.staged&&!f.untracked);
+  const untracked=files.filter(f=>f.untracked);
+  const conflicts=files.filter(f=>f.conflict);
+
+  function _row(f){
+    const status=f.status||'M';
+    const cls=status==='?'?'git-status-untracked':status==='A'?'git-status-added':status==='D'?'git-status-deleted':status==='R'?'git-status-renamed':'git-status-modified';
+    const stats=f.additions!==undefined&&f.deletions!==undefined&&f.additions+f.deletions>0?`<span class="git-file-stats"><span class="git-stat-add">+${f.additions}</span> <span class="git-stat-del">-${f.deletions}</span></span>`:'';
+    return `<div class="git-file-row" onclick="openGitFileDiff('${esc(f.path)}','${f.staged?'staged':'unstaged'}')" title="Click to view diff">`+
+      `<span class="git-file-status ${cls}">${status}</span>`+
+      `<span class="git-file-name">${esc(f.path)}</span>`+
+      stats+'</div>';
+  }
+  function _section(label,items){
+    if(!items.length)return '';
+    return `<div class="git-section"><div class="git-section-label">${label} (${items.length})</div>${items.map(_row).join('')}</div>`;
+  }
+  let html=_section('Staged',staged)+_section('Modified',modified)+_section('Untracked',untracked);
+  if(conflicts.length)html+=_section('Conflicts',conflicts);
+  if(git.truncated)html+='<div class="git-panel-truncated">Showing first '+files.length+' files</div>';
+  body.innerHTML=html;
+}
+
+async function openGitFileDiff(path,kind){
+  if(!S.session)return;
+  const sessionId=S.session.session_id;
+  try{
+    const data=await api(`/api/workspace/git/diff?session_id=${encodeURIComponent(sessionId)}&path=${encodeURIComponent(path)}&kind=${kind}`);
+    if(!S.session||S.session.session_id!==sessionId)return;
+    const diff=data.diff||'';
+    if(!diff.trim()){
+      if(typeof showToast==='function') showToast('No diff available for '+path,3000);
+      return;
+    }
+    // Show diff in the git changes panel body (replace file list with diff view)
+    const body=document.getElementById('gitChangesBody');
+    if(!body)return;
+    let diffHtml='';
+    if(typeof _renderVscodeDiff==='function'){
+      diffHtml=`<div class="git-diff-back"><button class="git-diff-back-btn" onclick="_loadGitChangesDetail()">← Back to file list</button></div>`;
+      diffHtml+=_renderVscodeDiff(diff,'');
+    }else{
+      diffHtml=`<div class="git-diff-back"><button class="git-diff-back-btn" onclick="_loadGitChangesDetail()">← Back to file list</button></div><pre class="diff-block"><code>${esc(diff)}</code></pre>`;
+    }
+    body.innerHTML=diffHtml;
+  }catch(e){
+    if(typeof showToast==='function') showToast('Failed to load diff: '+(e.message||e),3000);
   }
 }
 

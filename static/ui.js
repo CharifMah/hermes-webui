@@ -10090,7 +10090,8 @@ function _topbarMessageMetaText(){
 }
 
 // ── Chat tabs (VSCode-style horizontal tabs) ────────────────────────────────
-S.openTabs = S.openTabs || {}; // sid -> {title}
+S.openTabs = S.openTabs || {}; // sid -> {type, title}
+S.activeTab = null; // current active tab id
 
 function renderChatTabs(){
   const bar=document.getElementById('chatTabs');

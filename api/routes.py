@@ -12987,6 +12987,9 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path == "/api/git/status":
         return _handle_git_status(handler, parsed)
 
+    if parsed.path == "/api/git/repos":
+        return _handle_git_repos(handler, parsed)
+
     if parsed.path == "/api/git/branches":
         return _handle_git_branches(handler, parsed)
 
@@ -22410,6 +22413,27 @@ def _handle_git_status(handler, parsed):
         return j(handler, {"git": git_status(workspace)})
     except GitWorkspaceError as e:
         return _git_bad(handler, e)
+
+
+def _handle_git_repos(handler, parsed):
+    """List git repos found in the workspace (root + immediate subdirectories)."""
+    qs = parse_qs(parsed.query)
+    workspace = _git_session_workspace(handler, qs.get("session_id", [""])[0])
+    if workspace is None:
+        return True
+    from pathlib import Path
+    repos = []
+    try:
+        # Check workspace root
+        if (workspace / '.git').exists():
+            repos.append({'path': str(workspace), 'name': workspace.name})
+        # Check immediate subdirectories
+        for child in sorted(workspace.iterdir()):
+            if child.is_dir() and not child.name.startswith('.') and (child / '.git').exists():
+                repos.append({'path': str(child), 'name': child.name})
+    except (PermissionError, OSError):
+        pass
+    return j(handler, {"repos": repos})
 
 
 def _handle_git_branches(handler, parsed):

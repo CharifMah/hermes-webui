@@ -472,7 +472,18 @@ def resolve_git_context(workspace: str | Path) -> GitContext | None:
     ws = Path(workspace).expanduser().resolve()
     result = _run_git(ws, ["rev-parse", "--show-toplevel"], check=False)
     if result.returncode != 0:
-        return None
+        # Workspace root is not a git repo — search immediate subdirectories
+        try:
+            for child in sorted(ws.iterdir()):
+                if child.is_dir() and not child.name.startswith('.') and (child / '.git').exists():
+                    result = _run_git(child, ["rev-parse", "--show-toplevel"], check=False)
+                    if result.returncode == 0:
+                        ws = child
+                        break
+            else:
+                return None
+        except (PermissionError, OSError):
+            return None
     repo_root = Path(result.stdout.strip()).resolve()
     try:
         prefix = ws.relative_to(repo_root).as_posix()

@@ -1690,10 +1690,23 @@ def _run_git(args, cwd, timeout=3):
 
 
 def git_info_for_workspace(workspace: Path) -> dict:
-    """Return git info for a workspace directory, or None if not a git repo."""
+    """Return git info for a workspace directory, or None if not a git repo.
+    If the workspace root is not a git repo, search immediate subdirectories."""
+    git_dir = workspace
     if not (workspace / '.git').exists():
-        return None
-    branch = _run_git(['rev-parse', '--abbrev-ref', 'HEAD'], workspace)
+        # Search immediate subdirectories for a .git folder
+        found = False
+        try:
+            for child in sorted(workspace.iterdir()):
+                if child.is_dir() and not child.name.startswith('.') and (child / '.git').exists():
+                    git_dir = child
+                    found = True
+                    break
+        except (PermissionError, OSError):
+            pass
+        if not found:
+            return None
+    branch = _run_git(['rev-parse', '--abbrev-ref', 'HEAD'], git_dir)
     if branch is None:
         return None
     # Run the remaining git commands in parallel via threads — they are
@@ -1701,13 +1714,13 @@ def git_info_for_workspace(workspace: Path) -> dict:
     # serially.  Threading is safe here because each call blocks only on the
     # subprocess pipe, not on the GIL.
     def _ahead():
-        r = _run_git(['rev-list', '--count', '@{u}..HEAD'], workspace)
+        r = _run_git(['rev-list', '--count', '@{u}..HEAD'], git_dir)
         return int(r) if r and r.isdigit() else 0
     def _behind():
-        r = _run_git(['rev-list', '--count', 'HEAD..@{u}'], workspace)
+        r = _run_git(['rev-list', '--count', 'HEAD..@{u}'], git_dir)
         return int(r) if r and r.isdigit() else 0
     def _status():
-        out = _run_git(['status', '--porcelain'], workspace) or ''
+        out = _run_git(['status', '--porcelain'], git_dir) or ''
         lines = [l for l in out.splitlines() if l]
         modified = sum(1 for l in lines if len(l) >= 2 and (l[0] in 'MAR' or l[1] in 'MAR'))
         untracked = sum(1 for l in lines if l.startswith('??'))
@@ -1727,4 +1740,5 @@ def git_info_for_workspace(workspace: Path) -> dict:
         'ahead': ahead,
         'behind': behind,
         'is_git': True,
+        'repo_name': git_dir.name if git_dir != workspace else '',
     }

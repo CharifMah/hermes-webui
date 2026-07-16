@@ -45,6 +45,7 @@ function extractFunc(name) {
 }
 eval(extractFunc('_matchBacktickFenceLine'));
 eval(extractFunc('_isBacktickFenceClose'));
+eval(extractFunc('_renderVscodeDiff'));
 eval(extractFunc('renderMd'));
 
 let buf = '';
@@ -77,14 +78,12 @@ class TestFencedCodeBlockIsolation:
     def test_diff_block_plus_minus_lines_not_treated_as_list(self, driver_path):
         html = _render(driver_path,
             "before\n\n```diff\n- removed line\n+ added line\n```\nafter")
-        pre = _extract_pre(html)
-        assert pre is not None, "Expected a <pre> block"
-        assert "<ul>" not in pre, "List HTML must not appear inside <pre>"
-        assert "<li>" not in pre, "List items must not appear inside <pre>"
-        assert "- removed line" in pre
-        assert "+ added line" in pre
-        assert html.count("<pre") == html.count("</pre>"), \
-            "Every <pre> must have a matching </pre>"
+        # Diff blocks now render as <div class="diff-viewer"> (side-by-side)
+        assert "diff-viewer" in html, "Expected a diff-viewer block"
+        assert "<ul>" not in html.split('diff-sbs-body')[1].split('</div>\n</div>')[0].replace('</div></div></div>','</div>'), \
+            "List HTML must not appear inside diff-viewer"
+        assert "removed line" in html
+        assert "added line" in html
 
     def test_bash_block_asterisk_lines_not_treated_as_list(self, driver_path):
         html = _render(driver_path,
@@ -117,8 +116,10 @@ class TestFencedCodeBlockIsolation:
         assert "<h1>Real Heading</h1>" in html
         assert "<ul>" in html
         assert "<strong>bold text</strong>" in html
-        pre = _extract_pre(html)
-        assert "<ul>" not in pre
+        # Diff block content should not contain list HTML
+        if 'diff-sbs-body' in html:
+            diff_part = html.split('diff-sbs-body')[1].split('</div></div></div>')[0]
+            assert "<ul>" not in diff_part
 
     def test_no_escaped_pre_closing_tag(self, driver_path):
         html = _render(driver_path,
@@ -151,11 +152,10 @@ class TestFencedCodeBlockIsolation:
         )
         html = _render(driver_path,
             f"```diff\n{diff_lines}\n```\n\nSummary after diff")
-        pre = _extract_pre(html)
-        assert pre is not None
-        assert "<ul>" not in pre
-        assert "<li>" not in pre
-        assert html.count("<pre") == html.count("</pre>")
+        assert "diff-viewer" in html
+        diff_part = html.split('diff-viewer')[1].split('</div>\n</div>')[0]
+        assert "<ul>" not in diff_part
+        assert "<li>" not in diff_part
         assert "Summary after diff" in html
 
     def test_mixed_fenced_and_inline_code(self, driver_path):

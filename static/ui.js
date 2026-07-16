@@ -7540,26 +7540,20 @@ function renderMd(raw){
   s=s.replace(/\x00B(\d+)\x00/g,(_,i)=>_al_stash[+i]);
   // ── File path linkifier ──────────────────────────────────────────────────
   // Detect bare file paths in the text and turn them into clickable links.
-  // Matches:
-  //   • Absolute paths: /foo/bar.txt, C:\foo\bar.txt
-  //   • Relative paths with extensions: ./src/file.js, ../lib/utils.py
-  //   • Home paths: ~/config/file.yaml
-  // Paths inside <a>, <img>, <pre>, <code> are already stashed/linked and won't match.
-  // Image paths get inline preview via the /api/media system.
+  // Matches absolute Unix paths (/foo/bar.txt), home paths (~/file), and
+  // relative paths (./src/file.js) with a file extension.
+  // Paths inside <a>, <img>, <pre>, <code> are already stashed and won't match.
   // Uses data-filepath + event delegation (not inline onclick) for safety.
   const _path_stash=[];
   s=s.replace(/(<a\b[^>]*>[\s\S]*?<\/a>|<img\b[^>]*>|<pre\b[^>]*>[\s\S]*?<\/pre>|<code\b[^>]*>[^<]*<\/code>)/g,m=>{_path_stash.push(m);return `\x00K${_path_stash.length-1}\x00`;});
-  s=s.replace(/(^|[^\w\/])((?:\/[\w\-./]+|[A-Za-z]:\\[\w\-.\s\\]+|~\/[\w\-./]+|\.{0,2}\/[\w\-./]+)\.[a-zA-Z][a-zA-Z0-9]{0,4})(?=[\s,;:!?\)\]\}]|$)/g,(m,pre,path)=>{
-    const cleanPath=path;
-    const ext=cleanPath.split('.').pop().toLowerCase();
-    // Image paths → inline preview using /api/media
+  s=s.replace(/(^|[^:\/\w])((?:\/[\w\-.\/]+|~\/[\w\-.\/]+|\.{0,2}\/[\w\-.\/]+)\.[a-zA-Z][a-zA-Z0-9]{0,4})\b/g,(m,pre,path)=>{
+    const ext=path.split('.').pop().toLowerCase();
     if(_IMAGE_EXTS.test('.'+ext)){
       const sid=(typeof S!=='undefined'&&S&&S.session&&S.session.session_id)?S.session.session_id:'';
-      const mediaUrl='api/media?path='+encodeURIComponent(cleanPath)+(sid?'&session_id='+encodeURIComponent(sid):'');
-      return pre+`<img src="${mediaUrl}" alt="${esc(cleanPath)}" class="msg-media-img" loading="lazy">`;
+      const mediaUrl='api/media?path='+encodeURIComponent(path)+(sid?'&session_id='+encodeURIComponent(sid):'');
+      return pre+`<img src="${mediaUrl}" alt="${esc(path)}" class="msg-media-img" loading="lazy">`;
     }
-    // Non-image paths → clickable link with data-filepath (event delegation handles clicks)
-    return pre+`<a href="#" class="file-path-link" data-filepath="${esc(cleanPath)}">${esc(cleanPath)}</a>`;
+    return pre+`<a href="#" class="file-path-link" data-filepath="${esc(path)}">${esc(path)}</a>`;
   });
   s=s.replace(/\x00K(\d+)\x00/g,(_,i)=>_path_stash[+i]);
   // Restore math stash → katex placeholder spans/divs

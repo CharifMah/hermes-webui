@@ -210,6 +210,7 @@ function extractFunc(name) {
 }
 eval(extractFunc('_matchBacktickFenceLine'));
 eval(extractFunc('_isBacktickFenceClose'));
+eval(extractFunc('_renderVscodeDiff'));
 eval(extractFunc('renderMd'));
 
 let buf = '';

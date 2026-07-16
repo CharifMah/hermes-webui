@@ -4677,6 +4677,24 @@ function _openSessionActionMenu(session, anchorEl){
   menu.setAttribute('role','menu');
   menu.setAttribute('aria-label', 'Conversation actions');
   _appendSessionCopyLinkAction(menu, session);
+  // Open in new tab (adds to the tab bar without switching)
+  menu.appendChild(_buildSessionAction(
+    'Open in new tab',
+    'Open this conversation in a new editor tab',
+    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>',
+    async()=>{
+      closeSessionActionMenu();
+      const sid=session.session_id;
+      const title=session.title||'Untitled';
+      if(typeof addChatTab==='function'){
+        addChatTab(sid,title);
+      }
+      // Also load it so it becomes the active tab
+      if(typeof loadSession==='function'){
+        loadSession(sid);
+      }
+    }
+  ));
   if(isReadOnly){
     _appendSessionExportHtmlAction(menu, session);
     _mountSessionActionMenu(menu, session, anchorEl);

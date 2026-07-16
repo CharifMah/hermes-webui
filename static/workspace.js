@@ -842,19 +842,21 @@ function _renderGitChangesBody(container, git){
   var files=git.files||[];
 
   var html='';
-  // Branch header
+  // Branch header with dropdown
   html+='<div class="git-sidebar-branch">';
   html+='<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>';
-  html+='<span class="git-sidebar-branch-name">'+_escHtml(branch)+'</span>';
+  html+='<span class="git-sidebar-branch-name" onclick="gitToggleBranchDropdown()" style="cursor:pointer">'+_escHtml(branch)+' <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="opacity:.5"><polyline points="6 9 12 15 18 9"/></svg></span>';
   if(ahead>0) html+='<span class="git-sidebar-ahead" title="ahead by '+ahead+'">\u2191'+ahead+'</span>';
   if(behind>0) html+='<span class="git-sidebar-behind" title="behind by '+behind+'">\u2193'+behind+'</span>';
   html+='</div>';
+  // Branch dropdown (hidden by default, populated on click)
+  html+='<div id="gitBranchDropdown" class="git-branch-dropdown" style="display:none"></div>';
 
   // Action buttons
   html+='<div class="git-sidebar-actions">';
-  html+='<button class="git-action-btn" onclick="gitAction(\'fetch\')" title="Fetch from remote"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 1-9 9 9 9 0 0 1-9-9 9 9 0 0 1 9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg> Fetch</button>';
-  html+='<button class="git-action-btn" onclick="gitAction(\'pull\')" title="Pull from remote"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 9-9 9 9 0 0 1 9 9 9 9 0 0 1-9 9c-2.52 0-4.93-1-6.74-2.74L3 16"/><path d="M3 21v-5h5"/></svg> Pull</button>';
-  html+='<button class="git-action-btn git-action-push" onclick="gitAction(\'push\')" title="Push to remote"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg> Push</button>';
+  html+='<button class="git-action-btn" id="gitFetchBtn" onclick="gitAction(\'fetch\')" title="Fetch from remote"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 1-9 9 9 9 0 0 1-9-9 9 9 0 0 1 9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg> Fetch</button>';
+  html+='<button class="git-action-btn" id="gitPullBtn" onclick="gitAction(\'pull\')" title="Pull from remote"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 9-9 9 9 0 0 1 9 9 9 9 0 0 1-9 9c-2.52 0-4.93-1-6.74-2.74L3 16"/><path d="M3 21v-5h5"/></svg> Pull</button>';
+  html+='<button class="git-action-btn git-action-push" id="gitPushBtn" onclick="gitAction(\'push\')" title="Push to remote"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg> Push</button>';
   html+='</div>';
 
   // Group files by Staged / Modified / Untracked
@@ -946,14 +948,102 @@ function _renderVscodeDiff(container, diffText, path){
 
 async function gitAction(action){
   if(!S.session||!action) return;
+  var btnId='git'+action.charAt(0).toUpperCase()+action.slice(1)+'Btn';
+  var btn=document.getElementById(btnId);
+  if(btn){btn.classList.add('git-loading');btn.classList.remove('git-success','git-error');}
   if(typeof showToast==='function') showToast(action.charAt(0).toUpperCase()+action.slice(1)+'ing...',2000);
   try{
-    await api('/api/git/'+action,{method:'POST',body:JSON.stringify({session_id:S.session.session_id})});
+    var data=await api('/api/git/'+action,{method:'POST',body:JSON.stringify({session_id:S.session.session_id})});
+    if(btn){btn.classList.remove('git-loading');btn.classList.add('git-success');setTimeout(function(){btn.classList.remove('git-success');},2000);}
     if(typeof showToast==='function') showToast(action.charAt(0).toUpperCase()+action.slice(1)+' complete.',2000,'success');
     _loadGitChangesDetail();
-    _refreshGitBadge();
   }catch(e){
+    if(btn){btn.classList.remove('git-loading');btn.classList.add('git-error');setTimeout(function(){btn.classList.remove('git-error');},3000);}
     if(typeof showToast==='function') showToast((e&&e.message?e.message:action+' failed.'),5000,'error');
+  }
+}
+
+// ── Branch switching ──
+async function gitToggleBranchDropdown(){
+  var dd=document.getElementById('gitBranchDropdown');
+  if(!dd)return;
+  if(dd.style.display!=='none'){
+    dd.style.display='none';
+    return;
+  }
+  dd.style.display='block';
+  dd.innerHTML='<div style="padding:8px 14px;color:var(--muted);font-size:12px">Loading branches...</div>';
+  if(!S.session)return;
+  try{
+    var data=await api('/api/git/branches?session_id='+encodeURIComponent(S.session.session_id));
+    var br=data.branches||data;
+    if(!br||!br.is_git){dd.innerHTML='<div style="padding:8px 14px;color:var(--muted);font-size:12px">Not a git repo.</div>';return;}
+    var current=br.current||'';
+    var local=br.local||[];
+    var remote=br.remote||[];
+    var html='';
+    html+='<div class="git-branch-section"><div class="git-branch-section-label">Local</div>';
+    for(var i=0;i<local.length;i++){
+      var b=local[i];
+      var isCurrent=b.name===current;
+      html+='<div class="git-branch-item'+(isCurrent?' active':'')+'" onclick="gitCheckoutBranch(\''+b.name.replace(/'/g,"\\'")+'\')">';
+      html+='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0;opacity:.6"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>';
+      html+='<span>'+_escHtml(b.name)+'</span>';
+      if(isCurrent)html+='<span style="margin-left:auto;color:var(--muted);font-size:10px">✓</span>';
+      html+='</div>';
+    }
+    html+='</div>';
+    if(remote.length){
+      html+='<div class="git-branch-section"><div class="git-branch-section-label">Remote</div>';
+      for(var j=0;j<remote.length;j++){
+        var rb=remote[j];
+        // Skip HEAD symlink
+        if(rb.name&&rb.name.endsWith('/HEAD'))continue;
+        html+='<div class="git-branch-item" onclick="gitCheckoutBranch(\''+rb.name.replace(/'/g,"\\'")+'\')" title="Checkout '+_escHtml(rb.name)+'">';
+        html+='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0;opacity:.4"><circle cx="12" cy="12" r="3"/><path d="M3 12a9 9 0 0 1 9-9 9 9 0 0 1 9 9 9 9 0 0 1-9 9c-2.52 0-4.93-1-6.74-2.74L3 16"/></svg>';
+        html+='<span style="opacity:.7">'+_escHtml(rb.name)+'</span>';
+        html+='</div>';
+      }
+      html+='</div>';
+    }
+    // New branch input
+    html+='<div class="git-branch-new">';
+    html+='<input type="text" id="gitNewBranchInput" placeholder="Create new branch..." style="flex:1" onkeydown="if(event.key===\'Enter\')gitCreateBranch(this.value)">';
+    html+='<button onclick="gitCreateBranch(document.getElementById(\'gitNewBranchInput\').value)" title="Create branch"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></button>';
+    html+='</div>';
+    dd.innerHTML=html;
+  }catch(e){
+    dd.innerHTML='<div style="padding:8px 14px;color:var(--error,#e05);font-size:12px">'+_escHtml(e&&e.message?e.message:'Failed to load branches.')+'</div>';
+  }
+}
+
+async function gitCheckoutBranch(branch){
+  if(!branch||!S.session)return;
+  var dd=document.getElementById('gitBranchDropdown');
+  if(dd)dd.style.display='none';
+  if(typeof showToast==='function')showToast('Checking out '+branch+'...',2000);
+  try{
+    await api('/api/git/checkout',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,branch:branch})});
+    if(typeof showToast==='function')showToast('Switched to '+branch,2000,'success');
+    _loadGitChangesDetail();
+  }catch(e){
+    if(typeof showToast==='function')showToast((e&&e.message?e.message:'Checkout failed.'),5000,'error');
+  }
+}
+
+async function gitCreateBranch(name){
+  name=(name||'').trim();
+  if(!name||!S.session)return;
+  var dd=document.getElementById('gitBranchDropdown');
+  if(dd)dd.style.display='none';
+  if(typeof showToast==='function')showToast('Creating branch '+name+'...',2000);
+  try{
+    // Create and checkout in one step: checkout -b
+    await api('/api/git/checkout',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,branch:name,create:true})});
+    if(typeof showToast==='function')showToast('Created and switched to '+name,2000,'success');
+    _loadGitChangesDetail();
+  }catch(e){
+    if(typeof showToast==='function')showToast((e&&e.message?e.message:'Create branch failed.'),5000,'error');
   }
 }
 

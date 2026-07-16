@@ -956,6 +956,46 @@ function toggleGitChangesPanel(){
   }
 }
 
+// ── Git remote actions: fetch / pull / push ──
+async function gitAction(action){
+  if(!S.session)return;
+  const btn=document.querySelector(`.git-action-btn[onclick="gitAction('${action}')"]`);
+  if(!btn)return;
+  btn.classList.add('git-loading');
+  btn.classList.remove('git-success','git-error');
+  const sessionId=S.session.session_id;
+  try{
+    const data=await api(`/api/git/${action}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sessionId})});
+    if(!S.session||S.session.session_id!==sessionId)return;
+    btn.classList.remove('git-loading');
+    btn.classList.add('git-success');
+    setTimeout(()=>btn.classList.remove('git-success'),2000);
+    // Refresh the file list with updated status
+    if(data&&data.status){
+      _gitChangesFullData=data.status;
+      const body=document.getElementById('gitChangesBody');
+      if(body) _renderGitChangesBody(body,data.status);
+      _updateGitChangesPanel(data.status);
+    }else{
+      _loadGitChangesDetail();
+    }
+    // Also refresh the git badge
+    _refreshGitBadge();
+    if(typeof showToast==='function'){
+      const msg=data&&data.message?data.message:action.charAt(0).toUpperCase()+action.slice(1)+' complete';
+      showToast(msg,3000);
+    }
+  }catch(e){
+    btn.classList.remove('git-loading');
+    btn.classList.add('git-error');
+    setTimeout(()=>btn.classList.remove('git-error'),3000);
+    if(typeof showToast==='function'){
+      const msg=e&&e.message?e.message:action+' failed';
+      showToast(msg,5000,'error');
+    }
+  }
+}
+
 function _updateGitChangesPanel(git){
   // Update badge count on the git badge in workspace panel
   const branch=document.getElementById('gitChangesBranch');

@@ -2816,6 +2816,25 @@
   .chat-tab-add{display:inline-flex;align-items:center;justify-content:center;width:34px;flex-shrink:0;cursor:pointer;color:var(--muted);border:none;background:transparent;border-right:1px solid var(--border);}
   .chat-tab-add:hover{background:var(--hover-bg);color:var(--text);}
   .chat-tabs-drag-over{background:var(--accent-bg)!important;box-shadow:inset 0 2px 0 var(--info);}
+
+  /* ── Split view (dockable panels) ── */
+  .main-view.split-active{flex:1;min-width:0;}
+  .split-panel-right{display:none;flex:1;min-width:0;border-left:2px solid var(--border);flex-direction:column;background:var(--bg);overflow:hidden;}
+  .split-panel-tabs{display:flex;align-items:stretch;background:var(--input-bg);border-bottom:1px solid var(--border);min-height:34px;overflow-x:auto;flex-shrink:0;}
+  .split-panel-body{flex:1;overflow-y:auto;min-height:0;position:relative;}
+  .split-panel-empty{display:flex;align-items:center;justify-content:center;height:100%;color:var(--muted);font-size:13px;text-align:center;padding:20px;}
+  .split-drag-over{box-shadow:inset 0 0 0 2px var(--info);background:var(--accent-bg);}
+  .split-preview-code{margin:0;padding:12px;font-family:'JetBrains Mono','Cascadia Mono',monospace;font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;background:var(--code-bg);color:var(--pre-text);min-height:100%;}
+  .split-preview-md{padding:16px;max-width:100%;overflow-x:auto;}
+
+  /* Tab drag ghost (Sortable.js) */
+  .chat-tab-ghost{opacity:.4;background:var(--accent-bg)!important;}
+  /* Make session items draggable */
+  .session-item{cursor:grab;}
+  .session-item:active{cursor:grabbing;}
+  /* Split toggle button */
+  .split-toggle-btn{border:none;background:transparent;color:var(--muted);cursor:pointer;padding:2px 6px;border-radius:4px;display:inline-flex;align-items:center;gap:4px;font-size:11px;}
+  .split-toggle-btn:hover{background:var(--hover-bg);color:var(--text);}
   /* Git changes panel */
   .git-changes-panel{flex-shrink:0;border-bottom:1px solid var(--border);background:var(--surface);max-height:40vh;display:flex;flex-direction:column;overflow:hidden;}
   .git-changes-panel.collapsed .git-changes-body{display:none;}

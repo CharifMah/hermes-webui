@@ -10088,6 +10088,68 @@ function _topbarMessageMetaText(){
   // branch above surfaces the raw server total, and only as "loaded of total".
   return t('n_messages',loadedCount);
 }
+
+// ── Chat tabs (VSCode-style horizontal tabs) ────────────────────────────────
+S.openTabs = S.openTabs || {}; // sid -> {title}
+
+function renderChatTabs(){
+  const bar=document.getElementById('chatTabs');
+  if(!bar)return;
+  const sids=Object.keys(S.openTabs);
+  if(!sids.length){
+    bar.style.display='none';
+    return;
+  }
+  bar.style.display='flex';
+  const activeSid=S.session?S.session.session_id:null;
+  let html='';
+  for(const sid of sids){
+    const tab=S.openTabs[sid];
+    const isActive=sid===activeSid;
+    const title=tab.title||'Untitled';
+    html+=`<div class="chat-tab${isActive?' active':''}" onclick="switchToTab('${sid}')" title="${esc(title)}">`;
+    html+=`<span class="chat-tab-label">${esc(title)}</span>`;
+    html+=`<span class="chat-tab-close" onclick="event.stopPropagation();closeChatTab('${sid}')"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></span>`;
+    html+='</div>';
+  }
+  // + button to start new chat
+  html+=`<div class="chat-tab-add" onclick="startNewChatFromTab()" title="New chat"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></div>`;
+  bar.innerHTML=html;
+}
+
+function addChatTab(sid,title){
+  if(!sid)return;
+  S.openTabs[sid]={title:title||'Untitled'};
+  renderChatTabs();
+}
+
+function closeChatTab(sid){
+  if(!sid||!S.openTabs[sid])return;
+  delete S.openTabs[sid];
+  // If closing the active tab, switch to another open tab or start fresh
+  if(S.session&&S.session.session_id===sid){
+    const remaining=Object.keys(S.openTabs);
+    if(remaining.length){
+      loadSession(remaining[0]);
+    }else{
+      if(typeof startNewChat==='function') startNewChat();
+    }
+  }
+  renderChatTabs();
+}
+
+function switchToTab(sid){
+  if(!sid||!S.openTabs[sid])return;
+  if(S.session&&S.session.session_id===sid)return;
+  loadSession(sid);
+}
+
+function startNewChatFromTab(){
+  if(typeof startNewChat==='function'){
+    startNewChat();
+  }
+}
+
 function syncTopbar(){
   if(!S.session){
     document.title=assistantDisplayName();
@@ -10111,6 +10173,8 @@ function syncTopbar(){
     return;
   }
   const sessionTitle=S.session.title||t('untitled');
+  // Auto-create a tab for this session
+  addChatTab(S.session.session_id,sessionTitle);
   const _topbarTitle=$('topbarTitle');if(_topbarTitle)_topbarTitle.textContent=sessionTitle;
   document.title=sessionTitle+' \u2014 '+assistantDisplayName();
   if(typeof activeSessionHasPendingPromptAttention==='function'&&activeSessionHasPendingPromptAttention()){

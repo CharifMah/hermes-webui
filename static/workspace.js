@@ -896,7 +896,41 @@ function _renderGitChangesBody(container, git){
     html+='<div style="padding:12px;color:var(--muted);font-size:12px;text-align:center">No changes.</div>';
   }
 
+  // Commit history section
+  html+='<div class="git-section"><div class="git-section-label">Commits</div>';
+  html+='<div id="gitCommitsList" style="padding:4px 0"><div style="padding:8px 14px;color:var(--muted);font-size:11px">Loading commits...</div></div>';
+  html+='</div>';
+
   container.innerHTML=html;
+  // Load commits async
+  _loadGitCommits();
+}
+
+async function _loadGitCommits(){
+  if(!S.session)return;
+  var list=document.getElementById('gitCommitsList');
+  if(!list)return;
+  var sessionId=S.session.session_id;
+  try{
+    var data=await api('/api/git/log?session_id='+encodeURIComponent(sessionId)+'&count=20');
+    if(!S.session||S.session.session_id!==sessionId)return;
+    if(!data||!data.is_git){list.innerHTML='<div style="padding:8px 14px;color:var(--muted);font-size:11px">Not a git repo.</div>';return;}
+    var commits=data.commits||[];
+    if(!commits.length){list.innerHTML='<div style="padding:8px 14px;color:var(--muted);font-size:11px">No commits.</div>';return;}
+    var html='';
+    for(var i=0;i<commits.length;i++){
+      var c=commits[i];
+      var isLatest=i===0;
+      html+='<div class="git-commit-item'+(isLatest?' latest':'')+'" title="'+_escHtml(c.subject)+'">';
+      html+='<span class="git-commit-hash">'+_escHtml(c.short)+'</span>';
+      html+='<span class="git-commit-subject">'+_escHtml(c.subject)+'</span>';
+      html+='<span class="git-commit-meta">'+_escHtml(c.author)+' · '+_escHtml(c.date)+'</span>';
+      html+='</div>';
+    }
+    list.innerHTML=html;
+  }catch(e){
+    list.innerHTML='<div style="padding:8px 14px;color:var(--muted);font-size:11px">Failed to load commits.</div>';
+  }
 }
 
 async function openGitFileDiff(path){

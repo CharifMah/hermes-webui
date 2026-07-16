@@ -2900,6 +2900,13 @@
   .git-branch-new input:focus{border-color:var(--info);}
   .git-branch-new button{border:none;background:var(--accent-bg);color:var(--info);border-radius:6px;padding:4px 8px;cursor:pointer;display:flex;align-items:center;justify-content:center;}
   .git-branch-new button:hover{background:var(--accent-bg-strong);}
+  /* Commit items */
+  .git-commit-item{display:flex;flex-direction:column;gap:2px;padding:6px 14px;border-bottom:1px solid rgba(128,128,128,.06);cursor:default;transition:background .12s;}
+  .git-commit-item:hover{background:var(--hover-bg);}
+  .git-commit-item.latest{background:rgba(99,102,241,.04);}
+  .git-commit-hash{font-size:10px;color:var(--info);font-family:monospace;flex-shrink:0;}
+  .git-commit-subject{font-size:12px;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .git-commit-meta{font-size:10px;color:var(--muted);}
   .topbar-source-badge{display:inline-flex;align-items:center;margin-left:6px;padding:2px 7px;border-radius:999px;background:var(--accent-bg);color:var(--accent-text);font-size:10px;font-weight:700;letter-spacing:.02em;vertical-align:middle;}
   .git-badge.dirty{color:var(--accent-text);background:var(--accent-bg);}
   .panel-actions{grid-column:2;grid-row:1;display:flex;gap:4px;flex-shrink:0;margin-left:auto;}

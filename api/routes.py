@@ -12990,6 +12990,9 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path == "/api/git/repos":
         return _handle_git_repos(handler, parsed)
 
+    if parsed.path == "/api/git/log":
+        return _handle_git_log(handler, parsed)
+
     if parsed.path == "/api/git/branches":
         return _handle_git_branches(handler, parsed)
 
@@ -22434,6 +22437,21 @@ def _handle_git_repos(handler, parsed):
     except (PermissionError, OSError):
         pass
     return j(handler, {"repos": repos})
+
+
+def _handle_git_log(handler, parsed):
+    qs = parse_qs(parsed.query)
+    workspace = _git_session_workspace(handler, qs.get("session_id", [""])[0])
+    if workspace is None:
+        return True
+    try:
+        from api.workspace_git import GitWorkspaceError, git_log
+        count = int(qs.get("count", ["25"])[0])
+        return j(handler, git_log(workspace, count))
+    except GitWorkspaceError as e:
+        return _git_bad(handler, e)
+    except Exception as e:
+        return _git_bad(handler, e)
 
 
 def _handle_git_branches(handler, parsed):

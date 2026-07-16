@@ -1706,6 +1706,43 @@ def _remote_message(result: subprocess.CompletedProcess[str]) -> str:
     return (result.stdout or result.stderr or "").strip()
 
 
+def git_log(workspace: str | Path, count: int = 25) -> dict:
+    """Return recent commit history for the workspace git repo."""
+    ctx = resolve_git_context(workspace)
+    if ctx is None:
+        return {"is_git": False}
+    count = max(1, min(count, 100))
+    fmt = "%H%x1f%h%x1f%an%x1f%ad%x1f%s%x1f%b"
+    result = _run_git(
+        ctx,
+        ["log", f"-{count}", f"--pretty=format:{fmt}", "--date=short"],
+        check=True,
+    )
+    commits = []
+    for line in (result.stdout or "").split("\n"):
+        if not line.strip():
+            continue
+        parts = line.split("\x1f")
+        if len(parts) < 5:
+            continue
+        commits.append({
+            "hash": parts[0],
+            "short": parts[1],
+            "author": parts[2],
+            "date": parts[3],
+            "subject": parts[4],
+            "body": parts[5] if len(parts) > 5 else "",
+        })
+    # Current branch info
+    branch = _run_git(ctx, ["branch", "--show-current"], check=False).stdout.strip()
+    return {
+        "is_git": True,
+        "branch": branch or "HEAD",
+        "commits": commits,
+        "count": len(commits),
+    }
+
+
 def git_fetch(workspace: str | Path) -> dict:
     ctx = resolve_git_context(workspace)
     if ctx is None:

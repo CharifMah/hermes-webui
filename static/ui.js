@@ -10133,7 +10133,8 @@ function switchToFileTab(tabId){
 
 function addChatTab(sid,title){
   if(!sid)return;
-  S.openTabs[sid]={title:title||'Untitled'};
+  S.openTabs[sid]={type:'chat',title:title||'Untitled'};
+  S.activeTab=sid;
   renderChatTabs();
 }
 

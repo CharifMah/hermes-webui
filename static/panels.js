@@ -4836,7 +4836,7 @@ function _renderInsights(d, box, wikiStatus, skillUsage) {
     </div>
     ${dowHtml}
     ${hodHtml}
-    <div style="text-align:center;color:var(--muted);font-size:10px;margin-top:12px;opacity:.6">${esc(t('insights_footer').replace('{days}', d.period_days))}</div>
+    <div style="text-align:center;color:var(--muted);font-size:10px;margin-top:12px;opacity:.6">${esc(d.period_days === 0 ? t('insights_footer_all') : t('insights_footer').replace('{days}', d.period_days))}<button id="insightsExportBtn" onclick="exportInsightsData()" style="margin-left:12px;background:transparent;border:1px solid var(--border);color:var(--muted);font-size:10px;padding:2px 8px;border-radius:4px;cursor:pointer" data-i18n="insights_export">${esc(t('insights_export'))}</button></div>
   `;
 }
 

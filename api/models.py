@@ -5916,6 +5916,49 @@ def _sidebar_title_is_generic_webui(title: str | None) -> bool:
     return text.startswith(prefix) and text[len(prefix):].isdigit()
 
 
+# Cache for /api/sessions sidebar overrides: the (sessions-table read +
+# messages-table COUNT/MAX aggregation) is the dominant per-request cost on
+# state.db when it has thousands of messages. Polling cadence is 30s, so a
+# few-second TTL is enough to absorb the burst of /api/sessions calls that a
+# single tab fan-out (sidebar + streaming poll + active-session refresh +
+# session-events reconnect) makes on every load. mtime of the live WAL file
+# is the primary invalidator so concurrent writes (token-writer, gateway
+# writes) are reflected on the next poll; the TTL is a safety net for
+# mtime-preserving changes (e.g. write that updated an in-place row without
+# touching the journal). Same pattern as _SKILLS_STATS_CACHE in api/profiles.py.
+_SIDEBAR_OVERRIDES_CACHE: "dict[tuple, tuple[dict[str, dict], tuple[int, int, int], float]]" = {}
+_SIDEBAR_OVERRIDES_CACHE_TTL_SECONDS = 5.0
+_SIDEBAR_OVERRIDES_CACHE_LOCK = threading.Lock()
+
+
+def _sidebar_overrides_db_mtime_signature(db_path: Path) -> tuple[int, int, int] | None:
+    """Return a cheap mtime signature for the live state.db + WAL pair, or None on error.
+
+    The signature covers the main DB mtime+size, the WAL mtime+size, and the
+    SHM mtime+size. Including size makes the signature detect writes that
+    preserve mtime (rare but possible under some filesystems + coarse mount
+    options); including the WAL is mandatory because the live row count in
+    `messages` advances there before the next checkpoint.
+    """
+    try:
+        db_st = db_path.stat()
+    except OSError:
+        return None
+    try:
+        wal_st = db_path.with_name(db_path.name + '-wal').stat()
+    except OSError:
+        wal_st = None
+    try:
+        shm_st = db_path.with_name(db_path.name + '-shm').stat()
+    except OSError:
+        shm_st = None
+    return (
+        int(db_st.st_mtime_ns),
+        int(db_st.st_size),
+        int(wal_st.st_mtime_ns) if wal_st is not None else -1,
+    )
+
+
 def _read_state_db_sidebar_overrides(
     db_path: Path,
     session_ids: set[str],
@@ -5946,6 +5989,24 @@ def _read_state_db_sidebar_overrides(
         count_wanted = {str(sid) for sid in count_session_ids if sid} & wanted
     if not wanted or not db_path.exists():
         return {}
+
+    # Fast path: cache hit on the same db-path + (source_ids, count_ids) tuple
+    # while the live WAL mtime is unchanged. Avoids the per-poll /api/sessions
+    # messages-table GROUP BY scan that stalls when state.db has thousands of
+    # messages (#5132 followup). The mtime+size signature below is the
+    # invalidator; the 5s TTL is the safety net for mtime-preserving writes.
+    sig = _sidebar_overrides_db_mtime_signature(db_path)
+    cache_key: tuple | None = None
+    if sig is not None and count_session_ids is not None:
+        cache_key = (str(db_path), frozenset(wanted), frozenset(count_wanted))
+        now = time.monotonic()
+        with _SIDEBAR_OVERRIDES_CACHE_LOCK:
+            entry = _SIDEBAR_OVERRIDES_CACHE.get(cache_key)
+            if entry is not None:
+                cached_value, cached_sig, expiry = entry
+                if cached_sig == sig and now < expiry:
+                    return {sid: dict(v) for sid, v in cached_value.items()}
+
     try:
         import sqlite3
     except ImportError:
@@ -6070,6 +6131,25 @@ def _read_state_db_sidebar_overrides(
                         if display_title:
                             seen_user_messages.add(sid)
                             overrides.setdefault(sid, {})['_state_db_display_title'] = display_title
+            # Populate the cache BEFORE returning so subsequent /api/sessions
+            # polls within the same db-mtime window skip the messages-table
+            # GROUP BY scan. Bound the cache to a few hundred entries to
+            # avoid leaking memory on long-lived processes; LRU semantics are
+            # not required because (db_path, ids) is a function of the
+            # sidebar contents, which are themselves bounded by the session
+            # count cap.
+            if sig is not None and count_session_ids is not None and overrides is not None:
+                try:
+                    with _SIDEBAR_OVERRIDES_CACHE_LOCK:
+                        if len(_SIDEBAR_OVERRIDES_CACHE) > 256:
+                            _SIDEBAR_OVERRIDES_CACHE.clear()
+                        _SIDEBAR_OVERRIDES_CACHE[cache_key] = (
+                            {sid: dict(v) for sid, v in overrides.items()},
+                            sig,
+                            time.monotonic() + _SIDEBAR_OVERRIDES_CACHE_TTL_SECONDS,
+                        )
+                except Exception:
+                    pass
             return overrides
     except Exception:
         missing_source_ids = [

@@ -11678,16 +11678,25 @@ def _handle_insights(handler, parsed) -> bool:
 
     query = parse_qs(parsed.query)
     try:
-        days = min(max(int(query.get("days", ["30"])[0]), 1), 365)
+        days = int(query.get("days", ["30"])[0])
     except (ValueError, TypeError):
         days = 30
+    # 0 = "all time" (no cutoff). Otherwise clamp to [1, 3650] (~10 years).
+    if days < 0:
+        days = 0
+    if days > 3650:
+        days = 3650
 
     now = _time.time()
     today = _time.localtime(now)
     today_midnight = _time.mktime((today.tm_year, today.tm_mon, today.tm_mday, 0, 0, 0, today.tm_wday, today.tm_yday, today.tm_isdst))
     day_secs = 86400
-    first_day_ts = today_midnight - ((days - 1) * day_secs)
-    cutoff = first_day_ts
+    if days == 0:
+        # No cutoff: keep every session in the index, regardless of age.
+        cutoff = 0
+    else:
+        first_day_ts = today_midnight - ((days - 1) * day_secs)
+        cutoff = first_day_ts
 
     def _safe_usage_int(value) -> int:
         try:

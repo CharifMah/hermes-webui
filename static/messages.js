@@ -6486,10 +6486,14 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           // delivered the final messages and tool calls.
           if(typeof window!=='undefined') window._streamJustFinished=true;
           setTimeout(()=>{ if(typeof window!=='undefined') window._streamJustFinished=false; }, 5000);
-          // Expand render window to cover all messages so the done render
-          // doesn't hide Activity behind a tiny window (winSize=50).
+          // Expand render window so the done render doesn't hide Activity
+          // behind a tiny window (winSize=50) — but CAP at 4x default
+          // (same guard as sessions.js loadSession): a full uncapped expand
+          // re-renders the WHOLE transcript on giant sessions and hard-blocks
+          // the main thread for seconds (Brave "page ne repond pas").
           if(typeof _messageRenderableMessageCount==='function'&&typeof _messageRenderWindowSize!=='undefined'){
-            _messageRenderWindowSize=Math.max(typeof _currentMessageRenderWindowSize==='function'?_currentMessageRenderWindowSize():50, _messageRenderableMessageCount());
+            const _cap=(typeof MESSAGE_RENDER_WINDOW_DEFAULT==='number'?MESSAGE_RENDER_WINDOW_DEFAULT:50)*4;
+            _messageRenderWindowSize=Math.max(typeof _currentMessageRenderWindowSize==='function'?_currentMessageRenderWindowSize():50, Math.min(_messageRenderableMessageCount(), _cap));
           }
           // #4650 review: the agent turn that just completed may have changed
           // server-side reasoning config (e.g. a `/reasoning <level>` slash
@@ -7271,9 +7275,13 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           S.toolCalls=[];
         }
         if(isSessionViewed) _markSessionViewed(completedSid, session.message_count ?? S.messages.length);
-        // Expand render window so the settled render doesn't hide Activity.
+        // Expand render window so the settled render doesn't hide Activity —
+        // but CAP at 4x default (same guard as sessions.js loadSession):
+        // uncapped full-transcript expand re-renders EVERYTHING on giant
+        // sessions and hard-blocks the main thread for seconds.
         if(typeof _messageRenderableMessageCount==='function'&&typeof _messageRenderWindowSize!=='undefined'){
-          _messageRenderWindowSize=Math.max(typeof _currentMessageRenderWindowSize==='function'?_currentMessageRenderWindowSize():50, _messageRenderableMessageCount());
+          const _cap=(typeof MESSAGE_RENDER_WINDOW_DEFAULT==='number'?MESSAGE_RENDER_WINDOW_DEFAULT:50)*4;
+          _messageRenderWindowSize=Math.max(typeof _currentMessageRenderWindowSize==='function'?_currentMessageRenderWindowSize():50, Math.min(_messageRenderableMessageCount(), _cap));
         }
         syncTopbar();renderMessages({preserveScroll:true});
         if(typeof _restoreMessageRenderWindowAfterSettledRender==='function') _restoreMessageRenderWindowAfterSettledRender();

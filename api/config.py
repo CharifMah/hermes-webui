@@ -8602,9 +8602,21 @@ def _save_models_cache_to_disk(cache: dict) -> None:
             payload["_webui_version"] = runtime_version
         cache_path = _get_models_cache_path()
         tmp = str(cache_path) + f".{os.getpid()}.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
-        os.rename(tmp, str(cache_path))
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+            # os.replace (not os.rename): atomic AND replaces an existing
+            # destination on Windows too — os.rename raises FileExistsError
+            # there when the cache file already exists, silently leaving
+            # stale .tmp orphans and forcing a ~4s provider rebuild on
+            # every session visit (#perf session-load-latency).
+            os.replace(tmp, str(cache_path))
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
     except Exception:
         pass  # Non-fatal -- cache will rebuild on next call
 
@@ -10922,6 +10934,67 @@ def warm_models_catalog_provenance_if_cold() -> None:
         _available_models_cache_lock.release()
 
 
+def _schedule_background_models_refresh() -> None:
+    """Fire-and-forget live /api/models rebuild on a detached daemon thread.
+
+    perf(session-load-latency): called by get_available_models_for_session_visit
+    after it has already served a stale-but-usable disk catalog, so the user's
+    chat switch returns immediately and the live provider rebuild lands
+    out-of-band for the NEXT visit. get_available_models(force_refresh=True)
+    runs its own bounded rebuild (budget _LIVE_REBUILD_BUDGET_SECONDS) and
+    publishes through the same machinery as a foreground cold-path caller, so
+    the memory cache, the per-profile disk cache, and _cache_build_in_progress
+    are all left consistent whether the rebuild finishes within or over budget.
+
+    The calling thread's request-profile TLS is captured first and re-bound on
+    the daemon (profile_scope_for_detached_worker, #3957): without it the
+    rebuild would resolve the DEFAULT profile's credentials and publish into
+    the DEFAULT profile's cache file even when the visit came from a named
+    profile.
+
+    Single-flight: scheduling is skipped while a rebuild is already in
+    progress, so a burst of session visits cannot stack duplicate provider
+    probes. A sub-millisecond race between two schedulers can still spawn two
+    threads; the second coalesces behind the first inside get_available_models'
+    bounded path and returns a disk fallback nobody consumes — bounded cost,
+    same race concurrent forced callers already have.
+    """
+    from contextlib import nullcontext as _nullcontext
+
+    _active_profile_name = ""
+    _prof_scope_worker = None
+    try:
+        from api.profiles import (
+            get_active_profile_name as _gapn,
+            profile_scope_for_detached_worker as _prof_scope_worker,
+        )
+        _active_profile_name = (_gapn() or "").strip()
+    except Exception:
+        _prof_scope_worker = None
+
+    with _cache_build_cv:
+        if _cache_build_in_progress:
+            return
+
+    def _bg_refresh():
+        _worker_scope = (
+            _prof_scope_worker(_active_profile_name, "models bg refresh")
+            if _prof_scope_worker is not None
+            else _nullcontext()
+        )
+        try:
+            with _worker_scope:
+                get_available_models(force_refresh=True)
+        except Exception:
+            logger.debug("background models refresh failed", exc_info=True)
+
+    threading.Thread(
+        target=_bg_refresh,
+        name="models-catalog-bg-refresh",
+        daemon=True,
+    ).start()
+
+
 def get_available_models_for_session_visit() -> dict:
     """Return /api/models with a short session-visit freshness horizon.
 
@@ -10985,22 +11058,38 @@ def get_available_models_for_session_visit() -> dict:
     _mark("cache_age_stale_or_missing")
     stale_cached = disk_cached or _load_stale_models_cache_from_disk()
     _mark(f"stale_cached_loaded:{bool(stale_cached)}")
-    try:
-        _mark("force_refresh_start")
-        result = get_available_models(force_refresh=True)
-        _mark("force_refresh_done")
+    if stale_cached is not None:
+        # perf(session-load-latency): serve the stale-but-usable catalog
+        # IMMEDIATELY and let the live provider rebuild run out-of-band.
+        # The previous behavior ran get_available_models(force_refresh=True)
+        # synchronously here; on this host the per-provider probes (Copilot
+        # token exchange, OpenRouter /models, ...) reliably consume the whole
+        # _LIVE_REBUILD_BUDGET_SECONDS budget, so every chat switch after
+        # >_SESSION_VISIT_MODELS_FRESHNESS_SECONDS of idle paid ~4s. The
+        # background refresh publishes into the same memory/disk caches when
+        # it lands, so the next visit is already warm.
+        _mark("stale_returned_bg_refresh_scheduled")
+        _schedule_background_models_refresh()
         _maybe_log_slow_stages(_logger, _stagelog, _slow_threshold_ms, "models.session_visit")
-        return result
-    except Exception:
-        _mark("force_refresh_failed")
-        logger.debug("session-visit models refresh failed", exc_info=True)
-        if stale_cached is not None:
-            _mark("stale_fallback_return")
-            _maybe_log_slow_stages(_logger, _stagelog, _slow_threshold_ms, "models.session_visit")
-            return copy.deepcopy(stale_cached)
-        _mark("prefer_cache_fallback")
-        _maybe_log_slow_stages(_logger, _stagelog, _slow_threshold_ms, "models.session_visit")
-        return get_available_models(prefer_cache=True)
+        return copy.deepcopy(stale_cached)
+    # No stale catalog at all (first boot, or the disk cache was rejected by
+    # the schema/version check).
+    # perf(session-load-latency): never block the chat switch on a live
+    # provider rebuild. On this host the per-provider probes reliably exceed
+    # _LIVE_REBUILD_BUDGET_SECONDS, so the foreground call paid ~4s on EVERY
+    # visit to a profile whose disk cache was absent/rejected — and when the
+    # background probes stayed hung past the budget, the over-budget worker
+    # published out-of-band only after it eventually finished (sometimes
+    # never), leaving the disk cache unwritten and the next visit paying the
+    # full 4s again. _static_models_catalog_without_live_probes() is a
+    # network-free catalog built from local config/auth — shape-valid and
+    # instantly returnable — while _schedule_background_models_refresh()
+    # runs the live (bounded) rebuild out-of-band for the NEXT visitor, same
+    # contract as the stale-catalog branch above.
+    _mark("static_catalog_served_bg_refresh_scheduled")
+    _schedule_background_models_refresh()
+    _maybe_log_slow_stages(_logger, _stagelog, _slow_threshold_ms, "models.session_visit")
+    return copy.deepcopy(_static_models_catalog_without_live_probes())
 
 
 def _maybe_log_slow_stages(

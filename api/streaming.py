@@ -4936,6 +4936,11 @@ def _looks_invalid_generated_title(text: str) -> bool:
         or re.search(r'^\s*(i|we)\s+(should|need to|will|can)\b', s, flags=re.IGNORECASE)
         or re.search(r'^\s*let me\b', s, flags=re.IGNORECASE)
         or re.search(r"^\s*here(?:'s| is) (?:a |my )?(?:thinking|thought)", s, flags=re.IGNORECASE)
+        or re.search(
+            r'^\s*(?:Title|Titre)\s+(?:should\s+be\s+in\s+|in\s+(?:French|English|German|Spanish|fran\u00e7ais|anglais))',
+            s,
+            flags=re.IGNORECASE,
+        )
         or _looks_like_title_option_menu(s)
     )
 
@@ -4955,6 +4960,26 @@ def _is_bad_new_title(text: str) -> bool:
         _token,
         flags=re.IGNORECASE,
     ):
+        return True
+    if bool(
+        re.search(
+            r'^\s*(?:Title|Titre)\s+should\s+be\s+in\s+', s, flags=re.IGNORECASE
+        )
+        or re.search(r'^\s*(?:A|An)\s+(?:short\s+|good\s+)?title\s+in\s+', s, flags=re.IGNORECASE)
+        or re.search(r'^\s*(?:Title|Titre)\s+in\s+(?:French|English|German|Spanish)\b', s, flags=re.IGNORECASE)
+        or re.search(r'^\s*Titre\s+en\s+(?:fran\u00e7ais|anglais)\b', s, flags=re.IGNORECASE)
+        or re.search(
+            r'^\s*Something\s+like\s*[:\u201c"]?\s*(?:\"|\u201c)', s, flags=re.IGNORECASE
+        )
+        or re.search(
+            r'^\s*(?:3-8|three\s+to\s+eight|3\s+\u00e0\s+8)\s+(?:words|mots)\b', s, flags=re.IGNORECASE
+        )
+        or re.search(r'^\s*(?:topic\s+label|not\s+a\s+full\s+sentence)\b', s, flags=re.IGNORECASE)
+    ):
+        # Prompt-instruction echo: some models (e.g. glm-5.3-flash) return the
+        # title-generation instruction itself instead of the requested title.
+        # A legit session title never starts with phrasing like "Title should
+        # be in French, 3-8 words, topic label..." — see screenshot bug 2026-10.
         return True
     return bool(
         re.search(

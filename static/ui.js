@@ -574,6 +574,83 @@ function _messageVirtualDefaultHeightForRole(role){
     role&&Object.prototype.hasOwnProperty.call(MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS,role)?role:'default'
   ];
 }
+// #7591: the flat per-role constants above are only a PRIOR. On long sessions
+// with tall tool outputs, tables and inline images they ran 3.6x the measured
+// row height (#7591) — and 34% short on a 2,000-message session (#7283) — so
+// every virtual pad built from them was wrong by tens of thousands of px, which
+// is the error that flings the viewport on each mid-gesture re-window. Seed
+// unmeasured rows with what THIS transcript actually renders: per-role samples
+// shrink toward that role's flat prior until they carry the estimate alone, and
+// a role's mean freezes once it has MESSAGE_VIRTUAL_CALIBRATION_FREEZE_SAMPLES
+// samples so a live running mean cannot wobble the pads while the restore layer
+// chases the wobble. Measured rows never use this path (the height cache wins).
+const MESSAGE_VIRTUAL_CALIBRATION_PRIOR_SAMPLES=5;
+const MESSAGE_VIRTUAL_CALIBRATION_FREEZE_SAMPLES=20;
+let _messageVirtualRoleHeightSamples=Object.create(null);
+function _resetMessageVirtualRoleCalibration(){
+  _messageVirtualRoleHeightSamples=Object.create(null);
+}
+function _recordMessageVirtualRoleMeasurement(role,rawIdx,height){
+  const h=Number(height);
+  const idx=Number(rawIdx);
+  if(!(h>0)||!Number.isFinite(idx)) return;
+  const key=(role&&Object.prototype.hasOwnProperty.call(MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS,role))?role:'default';
+  if(!(Number(MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS[key])>0)) return;
+  let slot=_messageVirtualRoleHeightSamples[key];
+  // Rows, not render passes: the measure pass runs on every render over the SAME
+  // handful of mounted rows, so counting passes would freeze a role's mean on a
+  // couple of rows before the rest of the transcript was ever seen (#7591 P2).
+  if(!slot){ slot={rows:new Map(),frozen:0}; _messageVirtualRoleHeightSamples[key]=slot; }
+  if(slot.frozen>0) return;
+  if(slot.rows.get(idx)===h) return;
+  slot.rows.set(idx,h);
+  if(slot.rows.size>=MESSAGE_VIRTUAL_CALIBRATION_FREEZE_SAMPLES){
+    let sum=0;
+    for(const value of slot.rows.values()) sum+=value;
+    slot.frozen=sum/slot.rows.size;
+  }
+}
+function _shiftMessageVirtualRoleSamples(previousEntries, nextEntries, prependedCount){
+  const count=Math.max(0, Number(prependedCount)||0);
+  if(!(count>0)) return;
+  if(!Array.isArray(previousEntries)||!Array.isArray(nextEntries)) return;
+  // #7591: rawIdx is POSITIONAL over S.messages (see _getVisibleMessagesWithIdx),
+  // so prepending older history moves every key. The height cache is shifted for
+  // exactly this reason in _syncMessageVirtualHeightCache; these per-role samples
+  // must travel with it, or re-measuring the same rows after a prepend lands under
+  // fresh keys and counts them twice toward the freeze.
+  const remap=new Map();
+  for(let i=0;i<previousEntries.length;i++){
+    const previous=previousEntries[i];
+    const next=nextEntries[i+count];
+    if(!previous||!next) continue;
+    const from=Number(previous.rawIdx);
+    const to=Number(next.rawIdx);
+    if(Number.isFinite(from)&&Number.isFinite(to)&&from!==to) remap.set(from,to);
+  }
+  if(!remap.size) return;
+  for(const role in _messageVirtualRoleHeightSamples){
+    const slot=_messageVirtualRoleHeightSamples[role];
+    if(!slot||!slot.rows||!slot.rows.size) continue;
+    // A frozen role already carries its mean and ignores these rows; shifting
+    // them would be inert, so leave the slot untouched.
+    if(slot.frozen>0) continue;
+    const shifted=new Map();
+    for(const [idx,height] of slot.rows) shifted.set(remap.has(idx)?remap.get(idx):idx, height);
+    slot.rows=shifted;
+  }
+}
+function _messageVirtualCalibratedRoleHeight(role){
+  const key=(role&&Object.prototype.hasOwnProperty.call(MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS,role))?role:'default';
+  const prior=Number(MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS[key])||MESSAGE_VIRTUAL_DEFAULT_ROW_HEIGHTS.default;
+  const slot=_messageVirtualRoleHeightSamples[key];
+  if(!slot||!slot.rows.size) return Math.max(1,Math.round(prior));
+  if(slot.frozen>0) return Math.max(1,Math.round(slot.frozen));
+  let sum=0;
+  for(const value of slot.rows.values()) sum+=value;
+  const blended=(sum+MESSAGE_VIRTUAL_CALIBRATION_PRIOR_SAMPLES*prior)/(slot.rows.size+MESSAGE_VIRTUAL_CALIBRATION_PRIOR_SAMPLES);
+  return Math.max(1,Math.round(blended));
+}
 // Cycle-aware measurement burst tracking (#6654/#6717): instead of a flat
 // render cap, the burst remembers every window cycle key it has already seen.
 // An UNSEEN key means the window is still converging forward (A->B->C->settled
@@ -632,16 +709,28 @@ const _recycleResetAttrs=[
   'data-live-assistant-turn',
 ];
 let _scrollbarDragActive=false;
+// #7591: blank-viewport recovery clamps at most once per detection cycle (see
+// _clampVirtualizedBlankViewportToRenderedEdge); reset when a render lands on
+// rendered rows and on session switch (_clearMessageVirtualHeightCache).
+let _messageVirtualBlankClampAttempts=0;
+// #7591: the blank-viewport clamp writes scrollTop from INSIDE a render that
+// _compensateScrollForMeasurementDelta wraps. That wrapper then reads its own
+// deliberate jump as a measurement delta and writes scrollTopBefore+delta over
+// the recovered position, dropping the reader back into the blank gap it just
+// escaped (scrollbar-driven and measurement-driven renders alike). The clamp
+// stamps a FRESH token here; the wrapper compares the token it saw before its
+// render against the stamp, so only a recovery performed by ITS OWN render is
+// recognised — a stale stamp from an unwrapped render (jumpToTurnQuestion calls
+// renderMessages directly) can never suppress a legitimate compensation. The
+// stamp is cleared in the wrapper's finally so a throw cannot leak it.
+let _blankViewportRecoveryToken=0;
+let _blankViewportRecoveryApplied=0;
 function _markMessageVirtualScrollActive(){
   _messageVirtualScrollActive=true;
   clearTimeout(_messageVirtualScrollSettleTimer);
   _messageVirtualScrollSettleTimer=setTimeout(()=>{
     _messageVirtualScrollActive=false;
-    if(_messageVirtualDeferredMeasurement){
-      const deferred=_messageVirtualDeferredMeasurement;
-      _messageVirtualDeferredMeasurement=null;
-      _scheduleMessageVirtualMeasurementRefresh(deferred);
-    }
+    _resumeDeferredMessageVirtualMeasurement();
   },150);
 }
 // Cached visWithIdx array — invalidated when S.messages.length changes.
@@ -658,6 +747,10 @@ function _clearMessageVirtualHeightCache(){
   _messageVirtualHeightCacheEntries=[];
   _messageVirtualHeightCacheLen=0;
   _messageVirtualHeightCacheSrc=null;
+  // Per-session geometry state: the role calibration (#7591) and the blank-viewport
+  // clamp budget both describe THIS transcript and must not leak into the next one.
+  if(typeof _resetMessageVirtualRoleCalibration==='function') _resetMessageVirtualRoleCalibration();
+  _messageVirtualBlankClampAttempts=0;
   _messageVirtualEstimatedRowHeight=_messageVirtualDefaultHeightForRole('default');
   _messageVirtualWindowKey='';
   _messageVirtualMeasurementCycleKey='';
@@ -755,10 +848,17 @@ function _messageVirtualWindow(opts){
   const tailStart=Math.max(0, total-keepTailCount);
   const heights=Array.isArray(opts&&opts.heights)?opts.heights:[];
   const roleForIdx=typeof (opts&&opts.roleForIdx)==='function'?opts.roleForIdx:null;
+  // #7591: callers may hand in a calibrated per-role height (measured mean for
+  // this transcript) so unmeasured rows estimate reality instead of the flat
+  // prior; absent that hook the flat role constants remain the fallback.
+  const roleDefaultFor=typeof (opts&&opts.defaultHeightForRole)==='function'?opts.defaultHeightForRole:null;
   const rowHeightFor=(idx)=>{
     const cached=Number(heights[idx]);
     if(Number.isFinite(cached)&&cached>0) return cached;
-    return roleForIdx?Math.max(1,_messageVirtualDefaultHeightForRole(roleForIdx(idx))):defaultHeight;
+    if(!roleForIdx) return defaultHeight;
+    const role=roleForIdx(idx);
+    if(roleDefaultFor) return Math.max(1,roleDefaultFor(role));
+    return Math.max(1,_messageVirtualDefaultHeightForRole(role));
   };
   if(total<=Math.max(threshold, keepTailCount)){
     return {virtualized:false,start:0,end:total,topPad:0,bottomPad:0,total,tailStart};
@@ -830,8 +930,28 @@ function _resetMessageVirtualMeasurementBurst(){
   // an internal marker survive onto a render that fires later (#6717 re-gate).
   _messageVirtualRenderQueuedOrigin=null;
 }
+function _resumeDeferredMessageVirtualMeasurement(){
+  const deferred=_messageVirtualDeferredMeasurement;
+  if(!deferred) return;
+  _messageVirtualDeferredMeasurement=null;
+  _scheduleMessageVirtualMeasurementRefresh(deferred);
+}
+function _messageJumpScrollOwnsViewport(){
+  return typeof _messageJumpScrollOwner!=='undefined'&&!!_messageJumpScrollOwner;
+}
 function _scheduleMessageVirtualMeasurementRefresh(windowMetrics){
   if(_messageVirtualScrollActive){
+    _messageVirtualDeferredMeasurement=windowMetrics;
+    return;
+  }
+  // #7591: a jump-to-question is smooth-scrolling toward an answer row the
+  // render window does not contain yet, and it holds ownership of the viewport
+  // while it settles. An internal measurement render fired in that window
+  // re-derives the window from a stale key and restores its own anchor, which
+  // REPLACES the smooth-scroll target — the requested answer then settles above
+  // the viewport. Hold the measurement chain until the jump releases ownership
+  // (_finishMessageJumpScroll / _cancelMessageJumpScroll flush it back).
+  if(typeof _messageJumpScrollOwnsViewport==='function'&&_messageJumpScrollOwnsViewport()){
     _messageVirtualDeferredMeasurement=windowMetrics;
     return;
   }
@@ -882,7 +1002,16 @@ function _scheduleMessageVirtualMeasurementRefresh(windowMetrics){
   // external request coalesces into the queued rAF, EXTERNAL wins and the
   // render that fires degrades to an unmarked (burst-resetting) render
   // (#6717 re-gate).
-  requestAnimationFrame(()=>{ _scheduleMessageVirtualizedRender(true,{origin:'internal'}); });
+  requestAnimationFrame(()=>{
+    // Re-check ownership at FIRE time: a jump can begin between this schedule
+    // and the next frame, and rendering then would replace the jump's
+    // smooth-scroll target. Hold it for the jump's own settlement to flush.
+    if(typeof _messageJumpScrollOwnsViewport==='function'&&_messageJumpScrollOwnsViewport()){
+      _messageVirtualDeferredMeasurement=windowMetrics;
+      return;
+    }
+    _scheduleMessageVirtualizedRender(true,{origin:'internal'});
+  });
 }
 function _markMessageVirtualMeasurementsSettled(windowMetrics){
   _messageVirtualMeasurementCycleKey=_messageVirtualMeasurementCycleKeyFor(windowMetrics);
@@ -946,6 +1075,9 @@ function _syncMessageVirtualHeightCache(visWithIdx){
         for(let i=0;i<previousEntries.length;i++){
           nextHeights[prependedCount+i]=previousHeights[i];
         }
+        // #7591: the role calibration samples are keyed by the same positional
+        // rawIdx, so they shift with the heights they were measured for.
+        if(typeof _shiftMessageVirtualRoleSamples==='function') _shiftMessageVirtualRoleSamples(previousEntries, nextEntries, prependedCount);
       }
     }
   }
@@ -993,6 +1125,7 @@ function _currentMessageVirtualWindow(visWithIdx, keepTailCount){
     heights:_messageVirtualHeightCache,
     defaultHeight:_messageVirtualEstimatedRowHeight,
     roleForIdx:idx=>_messageVirtualRoleForEntry(visWithIdx[idx]),
+    defaultHeightForRole:(typeof _messageVirtualCalibratedRoleHeight==='function')?_messageVirtualCalibratedRoleHeight:null,
     keepTailCount,
   });
 }
@@ -1006,7 +1139,11 @@ function _messageVirtualPrependedHeightDelta(prependedRenderableCount){
   let total=0;
   for(let i=0;i<limit;i++){
     const cached=Number(_messageVirtualHeightCache[i]);
-    total+=(Number.isFinite(cached)&&cached>0)?cached:_messageVirtualDefaultHeightForRole(_messageVirtualRoleForEntry(visWithIdx[i]));
+    if(Number.isFinite(cached)&&cached>0){ total+=cached; continue; }
+    const role=_messageVirtualRoleForEntry(visWithIdx[i]);
+    total+=(typeof _messageVirtualCalibratedRoleHeight==='function')
+      ? _messageVirtualCalibratedRoleHeight(role)
+      : _messageVirtualDefaultHeightForRole(role);
   }
   return Math.max(0,Math.round(total));
 }
@@ -1088,7 +1225,11 @@ function _messageVirtualScrollTopForVisibleIdx(visWithIdx, visibleIdx, container
   let offset=0;
   for(let i=0;i<limit;i++){
     const cached=Number(_messageVirtualHeightCache[i]);
-    offset+=(Number.isFinite(cached)&&cached>0)?cached:_messageVirtualDefaultHeightForRole(_messageVirtualRoleForEntry(visWithIdx[i]));
+    if(Number.isFinite(cached)&&cached>0){ offset+=cached; continue; }
+    const role=_messageVirtualRoleForEntry(visWithIdx[i]);
+    offset+=(typeof _messageVirtualCalibratedRoleHeight==='function')
+      ? _messageVirtualCalibratedRoleHeight(role)
+      : _messageVirtualDefaultHeightForRole(role);
   }
   const viewport=container?Math.max(0,Number(container.clientHeight)||0):0;
   return Math.max(0,Math.round(offset-(viewport*0.35)));
@@ -1359,8 +1500,29 @@ function _compensateScrollForMeasurementDelta(renderFn){
   if(!container) return renderFn();
   const anchorBefore=_captureMessageViewportAnchor();
   const scrollTopBefore=container.scrollTop;
+  // A stamp left by an earlier, unwrapped render must never be mistaken for a
+  // recovery performed by THIS render (#7591).
+  _blankViewportRecoveryApplied=0;
+  const tokenBefore=_blankViewportRecoveryToken;
   container.classList.add('vscroll-measuring');
-  try{ renderFn(); }finally{ container.classList.remove('vscroll-measuring'); }
+  let recoveryApplied=false;
+  try{
+    renderFn();
+    recoveryApplied=_blankViewportRecoveryApplied>tokenBefore;
+  }finally{
+    container.classList.remove('vscroll-measuring');
+    // Read-then-clear in one finally, so a throw inside the render cannot leak
+    // the stamp into the next render and suppress a legitimate correction.
+    _blankViewportRecoveryApplied=0;
+  }
+  // #7591: the blank-viewport clamp moved scrollTop ON PURPOSE from inside this
+  // render. That deliberate jump is indistinguishable from a measurement delta,
+  // so the old-anchor compensation below would write scrollTopBefore+delta over
+  // the recovered position and put the reader back in the blank gap. The
+  // recovered position is the settled one for this render: the clamp already put
+  // a rendered row on screen, and the anchor it was captured against is no longer
+  // a reading position worth preserving.
+  if(recoveryApplied) return;
   if(!anchorBefore) return;
   if(scrollTopBefore<1){
     const spacer=container.querySelector('[data-virtual-spacer="before"]');
@@ -1409,7 +1571,10 @@ function _compensateScrollForMeasurementDelta(renderFn){
   const delta=actualOffset-anchorBefore.topOffset;
   if(Math.abs(delta)<2) return;
   _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
-  container.scrollTop=scrollTopBefore+delta;
+  // Correct from the CURRENT position. The render may already have moved scrollTop (the renderer restores its
+  // own anchor after calibration changes the spacer geometry); `delta` is measured against that position, so
+  // writing scrollTopBefore+delta threw the reader ~95 messages back on mobile (#8122 re-gate).
+  container.scrollTop+=delta;
   _lastScrollTop=container.scrollTop;
   _deferClearProgrammaticScroll();
 }
@@ -1552,6 +1717,11 @@ function _updateMessageVirtualMeasurements(renderVisWithIdx, renderVisibleIdxs, 
       _messageVirtualHeightCache[visibleIdx]=totalHeight;
       changed=true;
     }
+    // #7591: publish what this row really rendered so unmeasured rows of the
+    // same role estimate from the measured mean instead of the flat constant.
+    if(typeof _recordMessageVirtualRoleMeasurement==='function'){
+      _recordMessageVirtualRoleMeasurement(_messageVirtualRoleForEntry(entry), entry&&entry.rawIdx, totalHeight);
+    }
     measuredTotal+=totalHeight;
     measuredCount++;
   }
@@ -1666,6 +1836,20 @@ function _scheduleMessageVirtualizedRender(force, request){
     // unrelated render could steal (#6717 re-gate).
     const internalMeasurement=_messageVirtualRenderQueuedOrigin==='internal';
     _messageVirtualRenderQueuedOrigin=null;
+    // #7591: THIS callback is the LAST asynchronous hop of the internal
+    // measurement chain (measurement rAF -> here). The ownership re-check above
+    // runs in the first frame, so a jump that takes ownership BETWEEN the two
+    // frames used to render anyway: an internal measurement render re-derives
+    // the window from a stale key and restores its own anchor, which REPLACES
+    // the jump's smooth-scroll target and strands the requested answer above
+    // the viewport. Re-check before any compensation, programmatic-latch write
+    // or render, hold only INTERNAL work (genuine external renders must never
+    // be blanket-suppressed while a jump runs), and let finish/cancel flush it.
+    if(internalMeasurement&&typeof _messageJumpScrollOwnsViewport==='function'&&_messageJumpScrollOwnsViewport()){
+      const heldVisWithIdx=_getVisibleMessagesWithIdx();
+      _messageVirtualDeferredMeasurement=_currentMessageVirtualWindow(heldVisWithIdx,_messageVirtualKeepTailCount());
+      return;
+    }
     const liveVisWithIdx=_getVisibleMessagesWithIdx();
     const liveWindow=_currentMessageVirtualWindow(liveVisWithIdx,_messageVirtualKeepTailCount());
     const liveKey=_messageVirtualWindowKeyFor(liveWindow);
@@ -1693,15 +1877,28 @@ function _scheduleMessageVirtualizedRender(force, request){
 const _renderCache = new Map();
 const _renderCacheMax = 300;
 function _clearRenderCache(){ _renderCache.clear(); }
+// Two independent 32-bit multiplicative hashes over every UTF-16 unit of `text` (~64 bits together). Used for
+// long render-cache keys: the key must change whenever ANY character changes.
+function _renderCacheTextHash(text){
+  let a=0x811c9dc5, b=0x9e3779b9;
+  for(let i=0;i<text.length;i++){
+    const c=text.charCodeAt(i);
+    a=Math.imul(a^c,16777619)>>>0;
+    b=Math.imul(b^c,0x5bd1e995)>>>0;
+    b=(b^(b>>>15))>>>0;
+  }
+  return a.toString(36)+'.'+b.toString(36);
+}
 function _renderCacheKey(text, isUser){
   // Fold render_user_markdown state into user-message keys so toggling the
   // setting invalidates cached plain-text renders (#3870).
   const p = isUser ? (window._renderUserMarkdown ? 'um' : 'u') : 'a';
   // Short content: use the full string as key (cheap Map lookup).
-  // Long content: length + prefix + suffix is good enough — collisions on
-  // 20-char prefix+suffix are vanishingly rare for chat messages.
   if(text.length <= 500) return p + ':' + text;
-  return p + ':' + text.length + ':' + text.slice(0,20) + ':' + text.slice(-20);
+  // Long content: length + a hash of the whole text. The old length + first/last 20 characters key collided for
+  // equal-length messages that differ only in the middle (templated reports, regenerated answers, edited code),
+  // and the second message then displayed the first one's body.
+  return p + ':' + text.length + ':' + _renderCacheTextHash(text);
 }
 function _getCachedRender(text, isUser){
   const key = _renderCacheKey(text, isUser);
@@ -2687,22 +2884,796 @@ function _openMermaidLightbox(svgEl) {
   document.addEventListener('keydown', lb._keyHandler);
   return lb;
 }
+/* Mount pinch/pan/zoom gestures on an enlarged-image lightbox stage.
+ * Mirrors the Mermaid viewer's gesture architecture (see
+ * _mountMermaidViewer): Pointer Events drive single-finger drag/pan,
+ * Touch Events drive two-finger pinch-to-zoom, and the mouse wheel
+ * zooms anchored at the cursor. `touch-action: none` on the viewport
+ * is required so the browser never claims the touch sequence.
+ * state.pendingNav is set by _navigateLightbox to keep the zoom level
+ * while re-centring when switching to the next/previous image. */
+function _mountImgLightboxZoom(viewport, canvas, img, lb) {
+  const state = {
+    boxH: 0,
+    boxW: 0,
+    canvas,
+    dragOriginX: 0,
+    dragOriginY: 0,
+    dragPointerId: null,
+    dragStartX: 0,
+    dragStartY: 0,
+    dragged: false,
+    dragging: false,
+    fitScale: 1,
+    img,
+    navSrc: null,
+    pendingNav: false,
+    pinchCX: 0,
+    pinchCY: 0,
+    pinchDist: 0,
+    pinchIds: null,
+    pinchStartCX: 0,
+    pinchStartCY: 0,
+    pinchStartDist: 0,
+    pinchStartScale: 1,
+    pinchStartX: 0,
+    pinchStartY: 0,
+    pinching: false,
+    pointerX: 0,
+    pointerY: 0,
+    pressOnImage: false,
+    scale: 1,
+    // The pointerIds of the touch contacts currently down, in press order. The
+    // pointer events carry the id, the touch events do not, and the pan has to
+    // be re-armed from the contact still down when a pinch ends (see
+    // _imgArmDragFromRemainingTouch), so the two streams are tied together
+    // here (greptile P2 on 6f462d82, 2026-10-16T01:39:15Z, static/ui.js:3235).
+    touchPointerIds: [],
+    viewport,
+    x: 0,
+    y: 0,
+  };
+
+  function _imgViewportSize() {
+    const rect = viewport.getBoundingClientRect ? viewport.getBoundingClientRect() : null;
+    return {
+      width: Math.max(1, (rect && rect.width) || viewport.clientWidth || 1),
+      height: Math.max(1, (rect && rect.height) || viewport.clientHeight || 1),
+    };
+  }
+
+  function _imgClampPan() {
+    // Keep the transformed canvas inside the clipped viewport: an axis
+    // whose scaled size fits inside the stage gets centered, an overflow
+    // axis is clamped so the image can never be dragged wholly out of
+    // view (no reset path existed before — closing and reopening the
+    // lightbox was the only recovery). Called from _imgApplyTransform so
+    // every pan/pinch/wheel/resize/nav path is covered.
+    const size = _imgViewportSize();
+    const scaledW = state.boxW * state.scale;
+    const scaledH = state.boxH * state.scale;
+    if(scaledW <= size.width){
+      state.x = (size.width - scaledW) / 2;
+    } else {
+      state.x = Math.max(size.width - scaledW, Math.min(0, state.x));
+    }
+    if(scaledH <= size.height){
+      state.y = (size.height - scaledH) / 2;
+    } else {
+      state.y = Math.max(size.height - scaledH, Math.min(0, state.y));
+    }
+  }
+
+  function _imgApplyTransform() {
+    _imgClampPan();
+    canvas.style.transform = 'translate(' + Math.round(state.x) + 'px,' + Math.round(state.y) + 'px) scale(' + state.scale + ')';
+    canvas.style.transformOrigin = '0 0';
+  }
+
+  function _imgMinScale() {
+    return Math.min(0.25, state.fitScale);
+  }
+
+  function _imgFitScale() {
+    const size = _imgViewportSize();
+    // Cap at 1 to preserve the pre-PR no-upscale behavior
+    // (img{max-width:90vw;max-height:90vh;object-fit:contain} constrained
+    // oversized images but left small ones at intrinsic size). An unbounded
+    // ratio on a tiny image (e.g. 50px in a 900px viewport -> 18) would
+    // exceed the 8x zoom max, so the first wheel gesture would snap from 18
+    // to 8 instead of zooming smoothly. state.fitScale stores this bounded
+    // value because _imgMinScale() and the at-fit resize comparison depend
+    // on it.
+    return Math.min(1, size.width / state.boxW, size.height / state.boxH);
+  }
+
+  function _imgSetScale(nextScale, anchorX, anchorY) {
+    const bounded = Math.max(_imgMinScale(), Math.min(8, nextScale));
+    if(!Number.isFinite(bounded) || !state.boxW || !state.boxH) return;
+    const size = _imgViewportSize();
+    const focusX = Number.isFinite(anchorX) ? anchorX : size.width / 2;
+    const focusY = Number.isFinite(anchorY) ? anchorY : size.height / 2;
+    if(state.scale){
+      const ratio = bounded / state.scale;
+      state.x = focusX - (focusX - state.x) * ratio;
+      state.y = focusY - (focusY - state.y) * ratio;
+    }
+    state.scale = bounded;
+    _imgApplyTransform();
+  }
+
+  function _fit() {
+    // A fresh fit owns the geometry, so an in-flight gesture must not be able
+    // to write over it: a pinch or pan that began while the image was still
+    // decoding held a baseline from before the fit existed, and its next
+    // update scaled the just-fitted frame with it — a 4000×3000 image jumped
+    // from the fitted 351px width to 4080px on an iPhone, Fit was undone by
+    // the next finger movement, and a resize restored stale gesture positions
+    // (maintainer re-gate 2026-10-15T17:54:15Z, static/ui.js:2795). Cancel
+    // before measuring so the fit wins.
+    _imgCancelGesture();
+    const size = _imgViewportSize();
+    if(!state.boxW || !state.boxH) return;
+    const fitScale = _imgFitScale();
+    state.fitScale = fitScale;
+    state.scale = fitScale;
+    state.x = (size.width - state.boxW * fitScale) / 2;
+    state.y = (size.height - state.boxH * fitScale) / 2;
+    _imgApplyTransform();
+  }
+
+  function _centerPan() {
+    const size = _imgViewportSize();
+    state.x = (size.width - state.boxW * state.scale) / 2;
+    state.y = (size.height - state.boxH * state.scale) / 2;
+    _imgApplyTransform();
+  }
+
+  // The source + natural size of the frame whose geometry is already
+  // initialized. A cached image is decoded synchronously at mount
+  // (`img.complete`), yet the browser still dispatches its `load` event
+  // afterwards; that duplicate re-ran this initializer (through `_fit()`) after
+  // a navigation had already consumed `pendingNav`, silently dropping the
+  // user's zoom (trusted-Chromium reproduction: 1.7578125 → 0.9 — re-gate
+  // 2026-10-08T19:21:38Z, static/ui.js:3049 vs :2774). The pair is cleared by
+  // `_imgOnError()` so a failed image never looks "already initialized".
+  let _imgInitSrc = null;
+  let _imgInitW = 0;
+  let _imgInitH = 0;
+
+  function _onImgLoad() {
+    const nw = img.naturalWidth || img.width || 0;
+    const nh = img.naturalHeight || img.height || 0;
+    const src = img.currentSrc || img.src || '';
+    // Idempotent for an already initialized frame: a duplicate `load` for the
+    // SAME source and natural size, with no navigation pending, must not
+    // re-initialize (that re-fit is the zoom reset above). A pending navigation
+    // always initializes — that is the new image's geometry — and so does any
+    // change of source or natural size.
+    if(!state.pendingNav && _imgInitSrc === src && _imgInitW === nw && _imgInitH === nh){
+      return;
+    }
+    // A navigation is armed. The source the navigation asked for is recorded
+    // in `navSrc` by _navigateLightbox, so a load event for any OTHER source is
+    // the previous image's late `load` (it cannot be the frame that navigation
+    // asked for — the src swap reports its own source) and must not consume the
+    // flag. Comparing sources alone misread a navigation between two entries
+    // that SHARE a source as that duplicate, so the navigation's own load
+    // skipped init and recentring and the previous off-centre position was kept
+    // (maintainer re-gate 2026-10-15T17:54:15Z, static/ui.js:2843). With no
+    // recorded source (a directly armed flag) the duplicate test still applies.
+    if(state.pendingNav){
+      if(state.navSrc){
+        if(_imgSrcKey(src) !== state.navSrc) return;
+      } else if(src && _imgInitSrc === src && _imgInitW === nw && _imgInitH === nh){
+        return;
+      }
+    }
+    _imgInitSrc = src;
+    _imgInitW = nw;
+    _imgInitH = nh;
+    state.boxW = nw || 800;
+    state.boxH = nh || 450;
+    canvas.style.width = state.boxW + 'px';
+    canvas.style.height = state.boxH + 'px';
+    if(state.pendingNav){
+      state.pendingNav = false;
+      // The navigation this flag was armed for has now initialized its frame;
+      // drop the recorded source so it cannot classify a later load.
+      state.navSrc = null;
+      // The new image has its own fit baseline. Navigation keeps the user's
+      // zoom level, but a stale fitScale from the previous image would skew
+      // _imgMinScale() (zoom-out clamp) and the at-fit resize comparison:
+      // e.g. a small first image (fit 1.0) followed by a huge one (fit 0.1)
+      // would clamp zoom-out at 0.25 and make the real fit unreachable.
+      // Recompute only the baseline and re-clamp the kept scale to the new
+      // image's constraints.
+      //
+      // Fit is carried over, not the raw scale. If the previous image was at
+      // its fit (no user zoom), the new image must open at ITS OWN fit too —
+      // keeping the numeric scale crops a large image or shrinks a small one
+      // (reviewer re-gate 2026-10-08T23:18:39Z, static/ui.js:2800: 100×100 at
+      // fit 1 → 4000×3000 kept scale 1 and cropped; the reverse shrank the
+      // small image to ~25 px). A genuine user zoom (scale != fit) is still
+      // retained, bounded to the new image's constraints.
+      const wasAtFit = Math.abs(state.scale - state.fitScale) < 1e-9;
+      state.fitScale = _imgFitScale();
+      state.scale = wasAtFit
+        ? state.fitScale
+        : Math.max(_imgMinScale(), Math.min(8, state.scale));
+      _centerPan();
+      // A press that began while the new image was still loading recorded its
+      // baseline against the previous geometry, so its first move would undo
+      // the re-centre above. The image change also cancels the gesture (see
+      // _imgCancelGesture).
+      _imgCancelGesture();
+    } else {
+      _fit();
+    }
+  }
+
+  // A pan belongs to the pointer that started it. A second pointer pressing
+  // the stage mid-gesture must neither re-anchor the drag (that teleports the
+  // image to the new pointer) nor end it by releasing, and only the owning
+  // pointer's move/release may drive the pan — the same guard the sidebar
+  // resize handle carries (greptile review of #6896, 2026-10-05).
+  function _imgOwnsDrag(e) {
+    if(!e || e.pointerId == null) return true;
+    return state.dragPointerId == null || e.pointerId === state.dragPointerId;
+  }
+
+  function _imgOnError() {
+    // A failed load (navigating to a broken/missing image) must not leave the
+    // previous image's stage behind: only _onImgLoad used to clear pendingNav
+    // and refresh the canvas geometry, so the broken image inherited the old
+    // boxW/boxH, the old zoom baseline and the armed one-shot nav flag until
+    // some later image happened to load (greptile review of #6896,
+    // 2026-10-05).
+    //
+    // state.scale is deliberately NOT reset: keeping the user's zoom level
+    // across a navigation is this feature's stated contract, so a broken image
+    // in the middle of a sequence must not silently drop it. The next
+    // navigation re-arms pendingNav and the next successful load re-centres at
+    // the preserved scale (greptile follow-up, 2026-10-05).
+    //
+    // fitScale is deliberately left ALONE here. It holds the PREVIOUS image's
+    // fit baseline, and the next load compares |scale - fitScale| < 1e-9 to
+    // decide whether the new image opens at ITS own fit. Overwriting it in the
+    // error path misreads the user's zoom either way: a constant 1 made an
+    // image that WAS at fit (fitScale != 1) look user-zoomed and open cropped
+    // or undersized (greptile P1, 2026-10-08T23:43:03Z), while writing
+    // state.scale classified a deliberate zoom that happens to sit at exactly 1
+    // as "at fit", so the next image threw that zoom away and opened at its own
+    // fit (maintainer re-gate 2026-10-09T00:47:03Z, static/ui.js:2861). With no
+    // geometry (boxW=0) no scale math runs anyway: _fit() and _imgSetScale()
+    // bail out on the missing box.
+    state.pendingNav = false;
+    state.navSrc = null;
+    // A failed load cancels any gesture that is still in flight: the stage
+    // geometry is dropped below, so a pan or pinch baseline measured against it
+    // must not be re-applied to whatever loads next (maintainer re-gate
+    // 2026-10-15T17:54:15Z, static/ui.js:2795).
+    _imgCancelGesture();
+    state.dragging = false;
+    state.dragPointerId = null;
+    state.boxW = 0;
+    state.boxH = 0;
+    state.x = 0;
+    state.y = 0;
+    // Drop the "already initialized" tracking: a failed image has no usable
+    // geometry, so a later load of the very same source must initialize for
+    // real instead of being skipped as a duplicate (re-gate
+    // 2026-10-08T19:21:38Z).
+    _imgInitSrc = null;
+    _imgInitW = 0;
+    _imgInitH = 0;
+    canvas.style.width = '';
+    canvas.style.height = '';
+    canvas.style.transform = '';
+    viewport.classList.remove('is-panning');
+  }
+
+  // Whether a viewport point lands on the transformed canvas — i.e. on the
+  // image's own pixels rather than the letterboxed stage around it. Needed
+  // because pointer capture retargets the trusted click produced by a real
+  // mouse press on image pixels to the viewport (mouseup is captured, so the
+  // click's target is the closest common ancestor, the viewport), which made
+  // `e.target === viewport` also match a click on the image and dismissed the
+  // dialog (maintainer gate recheck of #6896, 2026-10-06).
+  function _imgPointOnCanvas(x, y) {
+    if(!Number.isFinite(x) || !Number.isFinite(y)) return false;
+    if(!canvas || typeof canvas.getBoundingClientRect !== 'function') return false;
+    const r = canvas.getBoundingClientRect();
+    if(!(r.width > 0) || !(r.height > 0)) return false;
+    return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+  }
+
+  function _imgOnPointerDown(e) {
+    if(e.pointerType === 'touch' && e.pointerId != null) _imgTrackTouchPointer(e.pointerId, true);
+    if(state.pinching) return;
+    if(e.button != null && e.button !== 0) return;
+    if(state.dragging) return;
+    // Record where the press landed BEFORE pointer capture is taken, and only
+    // for the press that actually owns the gesture (the guards above refuse a
+    // second pointer): a refused press must not re-classify the active
+    // gesture, or the owning pointer's click would be judged by a foreign
+    // press and a legitimate letterbox dismissal would be blocked (greptile
+    // review of #6896, 2026-10-05). e.target here is still the real hit
+    // element, and the geometric hit-test covers browsers that do not
+    // retarget the follow-up click to the viewport.
+    state.pressOnImage = !!((e.target && e.target !== viewport) ||
+      _imgPointOnCanvas(Number(e.clientX), Number(e.clientY)));
+    state.dragging = true;
+    state.dragged = false;
+    state.dragOriginX = Number(e.clientX) || 0;
+    state.dragOriginY = Number(e.clientY) || 0;
+    // The owning pointer's current position is remembered so a wheel zoom can
+    // rebase this drag's baseline (see _imgRebaseDrag).
+    state.pointerX = state.dragOriginX;
+    state.pointerY = state.dragOriginY;
+    state.dragPointerId = e.pointerId != null ? e.pointerId : null;
+    state.dragStartX = state.x;
+    state.dragStartY = state.y;
+    viewport.classList.add('is-panning');
+    if(viewport.setPointerCapture){
+      try{ viewport.setPointerCapture(e.pointerId); }catch(_){}
+    }
+    if(e.preventDefault) e.preventDefault();
+  }
+
+  function _imgOnPointerMove(e) {
+    if(state.pinching || !state.dragging) return;
+    if(!_imgOwnsDrag(e)) return;
+    const px = Number(e.clientX) || 0;
+    const py = Number(e.clientY) || 0;
+    // Only the owning pointer's position counts (the guards above refuse any
+    // other pointer), and a wheel zoom reads it to rebase the drag baseline.
+    state.pointerX = px;
+    state.pointerY = py;
+    const dx = px - state.dragOriginX;
+    const dy = py - state.dragOriginY;
+    if(Math.abs(dx) + Math.abs(dy) > 3) state.dragged = true;
+    state.x = state.dragStartX + dx;
+    state.y = state.dragStartY + dy;
+    _imgApplyTransform();
+    // _imgApplyTransform() clamped the pan to the stage. The baseline must
+    // follow the CLAMPED position: leaving the clamped-away overshoot inside
+    // dx made a drag that was reversed after overshooting an edge do nothing
+    // until the overshoot was retraced (maintainer re-gate 2026-10-15T17:54:15Z,
+    // static/ui.js:2993). Identity when the clamp did not bite.
+    state.dragStartX = state.x - dx;
+    state.dragStartY = state.y - dy;
+  }
+
+  function _imgEndPointerDrag(e) {
+    // A touch contact that ends (up / cancel) leaves the tracked set before the
+    // guards below: this handler early-returns whenever the pinch already
+    // cleared `dragging`, so a lost id would leave the set stale (see
+    // _imgTrackTouchPointer).
+    if(e && e.pointerType === 'touch' && e.pointerId != null) _imgTrackTouchPointer(e.pointerId, false);
+    if(!state.dragging) return;
+    // A non-owning pointer's release (or leave/cancel) must not kill the
+    // active pan while its owner is still down.
+    if(e && e.pointerId != null && !_imgOwnsDrag(e)) return;
+    state.dragging = false;
+    if(state.dragPointerId != null && viewport.releasePointerCapture){
+      try{ viewport.releasePointerCapture(state.dragPointerId); }catch(_){}
+    }
+    state.dragPointerId = null;
+    viewport.classList.remove('is-panning');
+    // Chromium withholds the synthesized click of a touch tap that lands in
+    // its post-fling tap-suppression window on a touch-action:none surface,
+    // so a clean letterbox tap right after a flick-pan never reached
+    // _onViewportClick and the dialog stayed open (release gate of #6896,
+    // 2026-10-08: first tap swallowed 4/4, master closed 6/6). Dismiss from
+    // the pointer sequence itself; marking dragged suppresses the click the
+    // browser does synthesize so the close never runs twice.
+    if(e && e.type === 'pointerup' && e.pointerType === 'touch' && !state.dragged && !state.pressOnImage &&
+       !_imgPointOnCanvas(Number(e.clientX), Number(e.clientY))){
+      state.dragged = true;
+      _closeImgLightbox(lb);
+    }
+  }
+
+  // A navigation swaps the image under an in-flight pan. The old gesture's
+  // recorded baseline (dragOrigin/dragStartX/Y) belongs to the previous
+  // image's coordinate space, so the first pointermove after the new image
+  // loads would re-apply it and teleport the freshly-centred image
+  // (maintainer re-warmup of #6896, 2026-10-06: press on the image, 1px move,
+  // ArrowRight, then a 5px move threw the new image 83px up). Changing the
+  // image therefore cancels the owned gesture; the user's zoom level is NOT
+  // touched — the pendingNav re-centre in _onImgLoad keeps it.
+  //
+  // Unlike an ordinary drag end this deliberately KEEPS the pointer capture
+  // (no releasePointerCapture): the browser releases the capture implicitly
+  // when the pointer goes up, and until then the capture keeps a held-button
+  // release retargeted to the viewport, so the follow-up click is still judged
+  // by the recorded press origin. Releasing it here sent a release outside the
+  // viewport straight to the backdrop and dismissed the dialog, bypassing the
+  // drag/click guard (greptile review of #6896, 2026-10-06).
+  function _imgCancelGesture() {
+    // A two-finger pinch keeps pinching/pinchStart* alive and only clears
+    // dragging (_imgOnTouchStart calls _imgEndPointerDrag), so the drag-only
+    // early return below used to let an in-flight zoom outlive a navigation.
+    // The next _imgOnTouchMove then applied the previous image's pinchStart
+    // baselines to the freshly-centred new image (maintainer review of #6896,
+    // 2026-10-06: two fingers down, ArrowRight, spread -> 544px jump).
+    // Clearing pinching makes _imgOnTouchMove a no-op until a fresh two-finger
+    // start re-anchors every pinchStart*; the selected zoom is left intact.
+    state.pinching = false;
+    state.pinchIds = null;
+    if(!state.dragging) return;
+    state.dragging = false;
+    state.dragPointerId = null;
+    viewport.classList.remove('is-panning');
+  }
+
+  function _onViewportClick(e) {
+    const wasDragged = state.dragged;
+    const pressOnImage = state.pressOnImage;
+    state.dragged = false;
+    state.pressOnImage = false;
+    // Suppress the browser's post-drag click (pointerdown+up on the same
+    // element closes the lightbox right after a pan) and clicks on the
+    // transformed canvas (image pixels). An undragged click on the
+    // viewport's own letterboxed area must bubble to the lightbox backdrop
+    // handler so clicking empty space around a fitted image still closes
+    // the dialog — clicks on visible pixels target the img/canvas while
+    // letterboxed clicks target the viewport (the img keeps pointer events so
+    // the native image context menu still works).
+    //
+    // The click's target alone cannot decide that: the pointer capture taken
+    // in _imgOnPointerDown retargets the click of a real mouse press on image
+    // pixels to the viewport, so `e.target === viewport` also matched clicks
+    // on the image and the dialog dismissed itself (maintainer gate recheck of
+    // #6896, 2026-10-06). Fall back to the recorded press origin and to a
+    // hit-test of the click point against the transformed canvas.
+    const onImage = pressOnImage ||
+      (e.target && e.target !== viewport) ||
+      _imgPointOnCanvas(Number(e.clientX), Number(e.clientY));
+    if(wasDragged || onImage){
+      if(e.stopPropagation) e.stopPropagation();
+    }
+  }
+
+  function _imgTouchDist(touches) {
+    if(!touches || touches.length < 2) return 0;
+    const dx = touches[0].clientX - touches[1].clientX;
+    const dy = touches[0].clientY - touches[1].clientY;
+    return Math.sqrt(dx * dx + dy * dy);
+  }
+
+  // Identifiers of the two contacts a pinch baseline belongs to. A pinch is a
+  // relationship between two specific fingers, so a baseline anchored on one
+  // pair is meaningless for another: replacing a finger of an active pinch (or
+  // lifting one of three) used to keep the stale baseline, and the next move
+  // rescaled and repositioned the image — an iPhone pinch dropped from 0.1638
+  // to 0.1260 after a 1px move (maintainer re-gate 2026-10-15T17:54:15Z,
+  // static/ui.js:3088).
+  function _imgPinchPair(touches) {
+    if(!touches || touches.length < 2) return null;
+    return [touches[0].identifier, touches[1].identifier];
+  }
+
+  function _imgSamePinchPair(touches) {
+    const pair = _imgPinchPair(touches);
+    const prev = state.pinchIds;
+    return !!(pair && prev && pair[0] === prev[0] && pair[1] === prev[1]);
+  }
+
+  // Anchor (or re-anchor) the pinch baseline on the pair of contacts currently
+  // under the fingers, so the ratio and the midpoint are always measured
+  // against the fingers that are down now.
+  function _imgAnchorPinch(touches) {
+    state.pinchIds = _imgPinchPair(touches);
+    state.pinchStartDist = _imgTouchDist(touches);
+    state.pinchStartScale = state.scale;
+    state.pinchStartX = state.x;
+    state.pinchStartY = state.y;
+    const rect = viewport.getBoundingClientRect();
+    state.pinchStartCX = (touches[0].clientX + touches[1].clientX) / 2 - (rect.left || 0);
+    state.pinchStartCY = (touches[0].clientY + touches[1].clientY) / 2 - (rect.top || 0);
+    // The geometry the contacts have RIGHT NOW, which is what a keyboard zoom
+    // re-anchors onto (see _imgRebasePinch).
+    state.pinchCX = state.pinchStartCX;
+    state.pinchCY = state.pinchStartCY;
+    state.pinchDist = state.pinchStartDist;
+  }
+
+  function _imgOnTouchStart(e) {
+    // Without dimensions there is nothing to zoom: a baseline recorded before
+    // the image decoded would be applied to a frame of unknown size and the fit
+    // that follows would be overwritten by the next touch update (maintainer
+    // re-gate 2026-10-15T17:54:15Z, static/ui.js:2795).
+    if(!state.boxW || !state.boxH) return;
+    if(e.touches.length === 2){
+      // A fresh pinch always anchors (pinchIds is cleared as the pinch ends);
+      // a touchstart that lands on an already-active pinch re-anchors whenever
+      // the pair under the fingers changed.
+      const keepsPair = state.pinching && _imgSamePinchPair(e.touches);
+      state.pinching = true;
+      if(!keepsPair) _imgAnchorPinch(e.touches);
+      _imgEndPointerDrag();
+      if(e.preventDefault) e.preventDefault();
+    }
+  }
+
+  function _imgOnTouchMove(e) {
+    if(!state.pinching || e.touches.length < 2) return;
+    if(!state.boxW || !state.boxH) return;
+    // The pair under the fingers can change without a touchstart (one finger of
+    // three is lifted, a finger is replaced): re-anchor before the ratio math
+    // so a stale baseline cannot resize or reposition the image.
+    if(!_imgSamePinchPair(e.touches)) _imgAnchorPinch(e.touches);
+    const rect = viewport.getBoundingClientRect();
+    const cx = (e.touches[0].clientX + e.touches[1].clientX) / 2 - (rect.left || 0);
+    const cy = (e.touches[0].clientY + e.touches[1].clientY) / 2 - (rect.top || 0);
+    const currDist = _imgTouchDist(e.touches);
+    state.pinchCX = cx;
+    state.pinchCY = cy;
+    state.pinchDist = currDist;
+    if(state.pinchStartDist > 0 && state.pinchStartScale > 0){
+      const rawScale = state.pinchStartScale * (currDist / state.pinchStartDist);
+      const boundedScale = Math.max(_imgMinScale(), Math.min(8, rawScale));
+      const ratio = boundedScale / state.pinchStartScale;
+      state.scale = boundedScale;
+      state.x = cx - (state.pinchStartCX - state.pinchStartX) * ratio;
+      state.y = cy - (state.pinchStartCY - state.pinchStartY) * ratio;
+      _imgApplyTransform();
+      // Re-anchor the WHOLE pinch baseline onto the frame just produced (the
+      // state.pinchC*/pinchDist set above), exactly as a fresh two-finger start
+      // does. Two reasons: leaving the clamped-away overshoot inside the
+      // baseline made a gesture reversed after overshooting an edge wait until
+      // the overshoot was retraced (greptile P2, 2026-10-15T23:15:55Z,
+      // static/ui.js:3213), and moving only the positional half (x/y) left the
+      // pair (pinchStartCX, pinchStartX) inconsistent with the scale baseline,
+      // so a later spread dragged the image ~700px away from the fingers
+      // (greptile P1, 2026-10-15T23:28:11Z, static/ui.js:3222; measured in
+      // gate1015_pinch_spread_is_path_independent). The anchored-zoom form is
+      // x = cx - (pinchStartCX - pinchStartX) * ratio, so the pair has to be
+      // re-anchored together on the current midpoint.
+      _imgRebasePinch();
+    }
+    if(e.preventDefault) e.preventDefault();
+  }
+
+  function _imgOnTouchEnd(e) {
+    if(e.touches.length < 2 && state.pinching){
+      state.pinching = false;
+      state.pinchIds = null;
+      state.dragged = true;
+      // Lifting one finger of a pinch must leave the contact still down able to
+      // pan, as it can on master: the pinch ended the pointer drag
+      // (_imgOnTouchStart calls _imgEndPointerDrag) and the remaining contact
+      // gets no new pointerdown, so every pointermove of it was dropped until
+      // the user lifted and pressed again (greptile P2 on 6f462d82,
+      // 2026-10-16T01:39:15Z, static/ui.js:3235). Re-arm the pan from the
+      // contact that is still there, anchored on its CURRENT geometry so the
+      // first move continues from the frame the pinch produced instead of
+      // jumping to a stale origin.
+      _imgArmDragFromRemainingTouch(e.touches);
+    }
+  }
+
+  // The touch stream carries no pointer id, so the contacts that are down are
+  // tracked from the pointer events (`down` starts a contact, otherwise it
+  // ended). Only touch pointers are tracked: a mouse press is not part of a
+  // pinch and must not be resurrected as one. Idempotent, so the duplicate
+  // pointerup/pointerleave a touch release delivers is harmless.
+  function _imgTrackTouchPointer(pointerId, down) {
+    if(!Array.isArray(state.touchPointerIds)) state.touchPointerIds = [];
+    const at = state.touchPointerIds.indexOf(pointerId);
+    if(down){
+      if(at === -1) state.touchPointerIds.push(pointerId);
+    } else if(at !== -1){
+      state.touchPointerIds.splice(at, 1);
+    }
+  }
+
+  function _imgArmDragFromRemainingTouch(touches) {
+    if(!touches || touches.length !== 1) return;
+    // A drag that survived the pinch keeps its own baseline.
+    if(state.dragging) return;
+    const contact = touches[0];
+    const ids = Array.isArray(state.touchPointerIds) ? state.touchPointerIds : [];
+    state.dragging = true;
+    // Exactly one tracked contact is expected here (the lifted one has already
+    // reported its pointerup). With anything else the drag stays ownerless
+    // rather than being handed to a pointer that may be gone; _imgOwnsDrag
+    // accepts any pointer while dragPointerId is null, and a second contact
+    // can only arrive through a touchstart, which ends this drag again.
+    state.dragPointerId = ids.length === 1 ? ids[0] : null;
+    state.dragOriginX = Number(contact.clientX) || 0;
+    state.dragOriginY = Number(contact.clientY) || 0;
+    state.pointerX = state.dragOriginX;
+    state.pointerY = state.dragOriginY;
+    state.dragStartX = state.x;
+    state.dragStartY = state.y;
+    // `dragged` stays true (set by the pinch) so the tap-dismiss guards keep
+    // treating this sequence as a gesture rather than a letterbox tap, and
+    // `pressOnImage` keeps the value of the press that started it.
+    viewport.classList.add('is-panning');
+    if(state.dragPointerId != null && viewport.setPointerCapture){
+      try{ viewport.setPointerCapture(state.dragPointerId); }catch(_){}
+    }
+  }
+
+  // Rebase the active pan's baseline onto the geometry the wheel just produced.
+  // A wheel zoom moves the image while the drag's baseline
+  // (dragOrigin / dragStartX/Y) still describes the pre-zoom position, so the
+  // next pointermove re-applied the entire accumulated displacement at the new
+  // scale and the image snapped — a 1px move moved 674px on desktop
+  // (maintainer re-gate 2026-10-15T17:54:15Z, static/ui.js:3134). Moving the
+  // baseline to the new position minus the owning pointer's displacement keeps
+  // the pan continuous.
+  function _imgRebaseDrag() {
+    if(!state.dragging) return;
+    if(!Number.isFinite(state.pointerX) || !Number.isFinite(state.pointerY)) return;
+    state.dragStartX = state.x - (state.pointerX - state.dragOriginX);
+    state.dragStartY = state.y - (state.pointerY - state.dragOriginY);
+  }
+
+  // The keyboard zoom (`state.zoomBy`) can land while a pinch is in flight, and
+  // a pinch holds its own baselines (pinchStartScale / pinchStartX,Y and the
+  // anchor midpoint). Refreshing only the pan left them measured against the
+  // pre-zoom geometry, so the next touchmove rescaled from the OLD scale and
+  // undid the keyboard zoom, and re-applied the old midpoint (greptile P2 on
+  // 860c0e85, 2026-10-15T19:09:46Z, static/ui.js:3293). Re-anchor on the
+  // contacts that are down now - exactly what a fresh two-finger start does - so
+  // the ongoing pinch continues from the new scale instead of reverting it.
+  function _imgRebasePinch() {
+    if(!state.pinching) return;
+    if(!(state.pinchDist > 0)) return;
+    if(!Number.isFinite(state.pinchCX) || !Number.isFinite(state.pinchCY)) return;
+    state.pinchStartScale = state.scale;
+    state.pinchStartX = state.x;
+    state.pinchStartY = state.y;
+    state.pinchStartDist = state.pinchDist;
+    state.pinchStartCX = state.pinchCX;
+    state.pinchStartCY = state.pinchCY;
+  }
+
+  function _imgZoomFromWheel(e) {
+    if(e.preventDefault) e.preventDefault();
+    const rect = viewport.getBoundingClientRect();
+    const anchorX = Number.isFinite(e.clientX) ? e.clientX - rect.left : undefined;
+    const anchorY = Number.isFinite(e.clientY) ? e.clientY - rect.top : undefined;
+    // Normalize the delta's units before scaling them. deltaMode 1 (lines) and
+    // 2 (pages) report a delta of a few units, not pixels, so treating them as
+    // pixels made a three-line tick zoom by 0.45%; the Mermaid viewer already
+    // normalizes with these 30/600 multipliers (maintainer re-gate
+    // 2026-10-15T17:54:15Z, static/ui.js:3133).
+    const deltaMode = Number(e.deltaMode) || 0;
+    const lineScale = deltaMode === 1 ? 30 : deltaMode === 2 ? 600 : 1;
+    const factor = Math.exp((-(Number(e.deltaY) || 0)) * lineScale * 0.0015);
+    _imgSetScale(state.scale * factor, anchorX, anchorY);
+    _imgRebaseDrag();
+    // A wheel tick under two held contacts is the same hazard as a keyboard
+    // zoom: it moves the image but the pinch keeps its own baselines (see
+    // _imgRebasePinch), so the next touchmove rescaled from the OLD scale and
+    // undid the wheel zoom (greptile P2 on the merge-only head 25684d89,
+    // 2026-10-15T22:36:41Z, static/ui.js:3275). Re-anchor the pinch too.
+    _imgRebasePinch();
+  }
+
+  function _onResize() {
+    if(lb._imgZoomResizeTimer && typeof clearTimeout === 'function') clearTimeout(lb._imgZoomResizeTimer);
+    lb._imgZoomResizeTimer = setTimeout(() => {
+      lb._imgZoomResizeTimer = null;
+      // A resize invalidates every gesture baseline (they were measured against
+      // the old viewport size), so it ends the gesture rather than restoring a
+      // stale position on the next move (maintainer re-gate
+      // 2026-10-15T17:54:15Z, static/ui.js:2795).
+      _imgCancelGesture();
+      const wasAtFit = Math.abs(state.scale - state.fitScale) < 1e-9;
+      if(wasAtFit || !state.boxW){
+        _fit();
+      } else {
+        // The fit baseline belongs to the NEW viewport too: keeping the old one
+        // left an obsolete zoom-out limit, so a preview resized from desktop to
+        // an iPhone could not zoom out past 0.25 while its new fit was 0.08775
+        // (maintainer re-gate 2026-10-15T17:54:15Z, static/ui.js:3145).
+        // Recompute the baseline and re-clamp the CHOSEN scale to it.
+        state.fitScale = _imgFitScale();
+        state.scale = Math.max(_imgMinScale(), Math.min(8, state.scale));
+        _centerPan();
+      }
+    }, 120);
+  }
+
+  viewport.onpointerdown = _imgOnPointerDown;
+  viewport.onpointermove = _imgOnPointerMove;
+  viewport.onpointerup = _imgEndPointerDrag;
+  viewport.onpointercancel = _imgEndPointerDrag;
+  viewport.onpointerleave = _imgEndPointerDrag;
+  viewport.onwheel = _imgZoomFromWheel;
+  viewport.onclick = _onViewportClick;
+  viewport.addEventListener('touchstart', _imgOnTouchStart, {passive: false});
+  viewport.addEventListener('touchmove', _imgOnTouchMove, {passive: false});
+  viewport.addEventListener('touchend', _imgOnTouchEnd);
+  viewport.addEventListener('touchcancel', function _imgOnTouchCancel(){ state.pinching = false; });
+
+  if(window && typeof window.addEventListener === 'function'){
+    window.addEventListener('resize', _onResize);
+    lb._imgZoomResizeHandler = _onResize;
+  }
+
+  // Expose keyboard-operable fit/zoom so the lightbox is not pointer-only.
+  state.fit = _fit;
+  state.zoomBy = function(factor){
+    _imgSetScale(state.scale * factor);
+    // A keyboard zoom is a zoom like the wheel's: whatever gesture is in flight
+    // keeps its baseline measured against the geometry it produced, so the next
+    // pointermove/touchmove must not snap the image back (greptile P2 on
+    // 860c0e85, 2026-10-15T19:09:46Z, static/ui.js:3293).
+    _imgRebaseDrag();
+    _imgRebasePinch();
+  };
+  // Used by _navigateLightbox (and by the pendingNav re-centre in
+  // _onImgLoad) to drop a pan that belongs to the image being replaced.
+  state.cancelGesture = _imgCancelGesture;
+
+  if(img.complete && img.naturalWidth){
+    _onImgLoad();
+  }
+  // Always attach onload — a cached/fast image may have taken the sync
+  // branch above, but navigation (src swap) still needs the handler.
+  img.onload = _onImgLoad;
+  // A failed load has its own handler so the stage never keeps the previous
+  // image's geometry (see _imgOnError).
+  img.onerror = _imgOnError;
+
+  return state;
+}
+
 function _openImgLightboxWithNav(src, alt, images, index) {
   const lb = document.createElement('div');
   lb.className = 'img-lightbox';
   lb.setAttribute('role', 'dialog');
   lb.setAttribute('aria-modal', 'true');
   lb.setAttribute('aria-label', alt || 'Image');
+  // Programmatically focusable so opening the dialog moves focus into it
+  // (the document-level shortcuts below then belong to the lightbox).
+  lb.setAttribute('tabindex', '-1');
+  // Zoomable stage: viewport (clip + gestures) > canvas (transform) > img.
+  const viewport = document.createElement('div');
+  viewport.className = 'img-lightbox-viewport';
+  const canvas = document.createElement('div');
+  canvas.className = 'img-lightbox-canvas';
   const img = document.createElement('img');
   img.src = src;
   img.alt = alt || '';
-  img.onclick = e => e.stopPropagation();
+  img.draggable = false;
+  canvas.appendChild(img);
+  viewport.appendChild(canvas);
   const cls = document.createElement('button');
   cls.className = 'img-lightbox-close';
   cls.setAttribute('aria-label', 'Close');
   cls.textContent = '×';
   cls.onclick = () => _closeImgLightbox(lb);
-  lb.appendChild(img);
+  // Fit/reset control — zoom is not pointer-only; a keyboard/button path
+  // recovers the image after it has been zoomed/panned out of view.
+  const fitBtn = document.createElement('button');
+  fitBtn.className = 'img-lightbox-fit';
+  // static/share.html loads ui.js WITHOUT i18n.js, so `t` may be undefined on
+  // the public share page: calling it threw ReferenceError before the lightbox
+  // mounted and broke every shared image preview (maintainer re-gate
+  // 2026-10-09T00:47:03Z, static/ui.js:3153). Fall back to the English string
+  // (the locale i18n.js ships for img_lightbox_fit_title) and reuse the result
+  // for both attributes.
+  const fitTitle = (typeof t === 'function') ? t('img_lightbox_fit_title') : 'Reset zoom to fit (F)';
+  fitBtn.setAttribute('aria-label', fitTitle);
+  fitBtn.setAttribute('title', fitTitle);
+  // Icon-only 36px circle matching the close button: the shared `fit` glyph
+  // from the Mermaid icon set removes the text pill that overlapped the image
+  // band and lost legibility over light images, and is language-neutral. The
+  // translated title/aria-label above keep the control announced for screen
+  // readers (maintainer visual review of #6896, 2026-10-08).
+  fitBtn.innerHTML = _mermaidViewerIcon('fit');
+  fitBtn.onclick = e => { e.stopPropagation(); if(lb._zoom && lb._zoom.fit) lb._zoom.fit(); };
+  lb.appendChild(viewport);
+  // Fit sits LEFT of close, so it comes first in the DOM: Tab order then matches the visual order.
+  lb.appendChild(fitBtn);
   lb.appendChild(cls);
   // Prev/Next navigation — store index and images on lb so a single set of
   // handlers reads live values without closure churn on every nav.
@@ -2728,15 +3699,64 @@ function _openImgLightboxWithNav(src, alt, images, index) {
   }
   lb.onclick = () => _closeImgLightbox(lb);
   document.body.appendChild(lb);
+  // Move focus into the dialog: without this a user could Tab into the
+  // composer behind the overlay and have `+`, `-`, `f` and the arrow keys
+  // hijacked by the shortcuts below (greptile review of #6896, 2026-10-05).
+  // The previous focus is restored when the lightbox closes.
+  lb._restoreFocus = (document.activeElement && document.activeElement !== document.body)
+    ? document.activeElement
+    : null;
+  if(typeof lb.focus === 'function'){
+    try{ lb.focus({preventScroll: true}); }catch(_){ try{ lb.focus(); }catch(__){} }
+  }
+  // Mount zoom gestures AFTER the stage is in the DOM — a synchronously
+  // decoded image (data: URL or cache-hit) otherwise measures a 0x0
+  // viewport and fit-zooms to a near-zero scale.
+  lb._zoom = _mountImgLightboxZoom(viewport, canvas, img, lb);
   // Single keyboard handler — reads lb._navX live, no remove/add churn.
   lb._keyHandler = e => {
     if(e.key==='Escape'){ _closeImgLightbox(lb); return; }
+    // Focus is normally inside the dialog, but never hijack typing: the
+    // handler lives on `document`, so a `+`, `-`, `f` or arrow key typed in
+    // an editable field that happens to hold focus must reach that field
+    // unchanged (greptile review of #6896, 2026-10-05).
+    const tgt = e.target;
+    if(tgt){
+      const tag = String(tgt.tagName || '').toLowerCase();
+      if(tgt.isContentEditable || tag === 'input' || tag === 'textarea' || tag === 'select') return;
+    }
+    // Never hijack a browser/OS shortcut: Ctrl/Meta + '+'/'='/'-'/'_' is the
+    // browser's own page zoom (Ctrl+F is find-in-page, Alt/⌘+Arrow is history
+    // navigation), so leave those combinations unprevented and let the
+    // unmodified image controls below keep working (maintainer gate recheck of
+    // #6896, 2026-10-06).
+    if(e.ctrlKey || e.metaKey || e.altKey) return;
+    if(e.key==='f' || e.key==='F'){ if(lb._zoom && lb._zoom.fit) lb._zoom.fit(); return; }
+    if(e.key==='+' || e.key==='='){ e.preventDefault(); if(lb._zoom && lb._zoom.zoomBy) lb._zoom.zoomBy(1.25); return; }
+    if(e.key==='-' || e.key==='_'){ e.preventDefault(); if(lb._zoom && lb._zoom.zoomBy) lb._zoom.zoomBy(1/1.25); return; }
     if(lb._navImages){
       if(e.key==='ArrowLeft'){ e.preventDefault(); _navigateLightbox(lb, -1); }
       if(e.key==='ArrowRight'){ e.preventDefault(); _navigateLightbox(lb, 1); }
     }
   };
   document.addEventListener('keydown', lb._keyHandler);
+}
+// Resolve an image source to the form the browser reports back in
+// `img.currentSrc`/`img.src`, so a raw string from the images array and a
+// resolved URL compare equal. Used to tell which frame a navigation asked for
+// (see _navigateLightbox / _onImgLoad): the same attachment can be referenced
+// both ways and two entries can share one source.
+function _imgSrcKey(src) {
+  const s = String(src || '');
+  if(!s) return '';
+  try{
+    if(document && document.createElement){
+      const a = document.createElement('a');
+      a.href = s;
+      return a.href;
+    }
+  }catch(_){ /* fall back to the raw string */ }
+  return s;
 }
 function _navigateLightbox(lb, direction) {
   const images = lb._navImages;
@@ -2747,21 +3767,48 @@ function _navigateLightbox(lb, direction) {
   const nextImg = images[newIndex];
   const lbImg = lb.querySelector('img');
   if(!lbImg) return;
+  // The new image invalidates any in-flight pan baseline, which belongs to
+  // the previous image's coordinate space (see _imgCancelGesture). Cancel
+  // before the src swap so the old gesture cannot outlive its image.
+  if(lb._zoom && lb._zoom.cancelGesture) lb._zoom.cancelGesture();
   lbImg.src = nextImg.src;
   lbImg.alt = nextImg.alt || '';
   lb.setAttribute('aria-label', nextImg.alt || 'Image');
+  // Keep the current zoom level when switching images (re-centre on the
+  // new image once it loads) — matches native photo-gallery behaviour.
+  if(lb._zoom) lb._zoom.pendingNav = true;
+  // Record WHICH source this navigation asked for. _onImgLoad uses it to tell
+  // this frame's load apart from the previous image's late load — and, the
+  // point of the record, to keep a navigation between two entries that SHARE a
+  // source an intentional re-centre instead of classifying it as that duplicate
+  // (maintainer re-gate 2026-10-15T17:54:15Z, static/ui.js:2843).
+  if(lb._zoom) lb._zoom.navSrc = _imgSrcKey(nextImg.src);
   // Update counter via stored reference — no DOM query.
   if(lb._counterEl) lb._counterEl.textContent = (newIndex+1) + ' / ' + images.length;
 }
 function _closeImgLightbox(lb) {
   if(!lb || !lb.parentNode) return;
   document.removeEventListener('keydown', lb._keyHandler);
+  // Hand focus back to whatever was focused before the dialog opened — the
+  // lightbox moved focus into itself on open (see _openImgLightboxWithNav).
+  if(lb._restoreFocus && typeof lb._restoreFocus.focus === 'function' &&
+     typeof document.contains === 'function' && document.contains(lb._restoreFocus)){
+    try{ lb._restoreFocus.focus({preventScroll: true}); }catch(_){}
+  }
+  lb._restoreFocus = null;
   if(lb._mermaidResizeHandler && window && typeof window.removeEventListener === 'function'){
     window.removeEventListener('resize', lb._mermaidResizeHandler);
   }
   if(lb._mermaidResizeTimer && typeof clearTimeout === 'function'){
     clearTimeout(lb._mermaidResizeTimer);
     lb._mermaidResizeTimer = null;
+  }
+  if(lb._imgZoomResizeHandler && window && typeof window.removeEventListener === 'function'){
+    window.removeEventListener('resize', lb._imgZoomResizeHandler);
+  }
+  if(lb._imgZoomResizeTimer && typeof clearTimeout === 'function'){
+    clearTimeout(lb._imgZoomResizeTimer);
+    lb._imgZoomResizeTimer = null;
   }
   lb.style.animation = 'lb-in .12s ease reverse';
   setTimeout(() => lb.parentNode && lb.parentNode.removeChild(lb), 120);
@@ -3092,8 +4139,22 @@ function _inlineMediaHtmlForRef(ref, sessionId, altText){
   if(/^file:\/\//i.test(ref)){
     try{
       const u=new URL(ref);
+      // #8033: file:///C:/Users/me/x parses to pathname '/C:/Users/me/x' —
+      // the file-URI grammar keeps the leading separator before the drive
+      // letter. The once-decoded pathname is forwarded to the backend AS-IS
+      // (no client-side strip): the server gates the drive-letter conversion
+      // on its own OS, so on a POSIX server '/C:/...' stays absolute and can
+      // never alias a cwd-relative drive-shaped path. Non-local file
+      // authorities (UNC: file://server/share/...) are explicitly rejected
+      // here — never silently rewired to a local path.
+      if(u.hostname&&!/^(localhost|127\.0\.0\.1|\[::1\])$/i.test(u.hostname)) return '';
       ref=decodeURIComponent(u.pathname||ref.replace(/^file:\/\//i,''));
     }catch(_){
+      // Fail-closed on a parse failure (AGENTS.md): the raw string may hide
+      // a non-local authority that the URL parse above never got to check.
+      // Reject anything shaped like 'file://<authority>/...' rather than
+      // silently rendering a local media element from it.
+      if(/^file:\/\/[^/?#]+/i.test(ref)) return '';
       try{ref=decodeURIComponent(ref.replace(/^file:\/\//i,''));}
       catch(__){ref=ref.replace(/^file:\/\//i,'');}
     }
@@ -3220,7 +4281,17 @@ else _initMediaPlaybackObserver();
 setTimeout(_initMediaPlaybackObserver,0);
 
 // ── Ambient provider quota indicator (#1766) ────────────────────────────────
-let _providerQuotaRefreshInFlight=false;
+// A provider switch can complete before an older account-quota request returns.
+// Only the newest request may update the composer; otherwise an old Codex result
+// can reappear while the active conversation uses another provider.
+let _providerQuotaRefreshSeq=0;
+let _providerQuotaContextIdentity;
+// profile|provider whose numbers the chip currently shows (null when cleared). A refetch for the same
+// profile and provider keeps them visible instead of blanking the chip until the response arrives.
+let _providerQuotaRenderedKey=null;
+function _providerQuotaProfileKey(){
+  return (typeof S!=='undefined'&&S&&S.activeProfile)?String(S.activeProfile):'';
+}
 
 function _formatQuotaMoneyShort(value){
   const n=Number(value);
@@ -3257,67 +4328,270 @@ function _providerQuotaIndicatorText(status){
   }
   return null;
 }
+function clearProviderQuotaIndicator(){
+  _providerQuotaRenderedKey=null;
+  const chip=$('providerQuotaChip');
+  const label=$('providerQuotaChipLabel');
+  const mobileAction=$('composerMobileQuotaAction');
+  const mobileLabel=$('composerMobileQuotaLabel');
+  if(chip){chip.hidden=true;chip.removeAttribute('title');}
+  if(label) label.textContent='';
+  if(mobileAction){mobileAction.hidden=true;mobileAction.removeAttribute('title');}
+  if(mobileLabel) mobileLabel.textContent='';
+}
 function renderProviderQuotaIndicator(status){
   const chip=$('providerQuotaChip');
   const label=$('providerQuotaChipLabel');
   const mobileAction=$('composerMobileQuotaAction');
   const mobileLabel=$('composerMobileQuotaLabel');
-  if(!chip||!label) return;
+  if(!chip||!label){
+    clearProviderQuotaIndicator();
+    return;
+  }
   // Hide entirely when the user has disabled the ambient quota chip in Settings.
   // Boot defaults this on; an explicit false preference suppresses it.
   if(window._showQuotaChip!==true){
-    chip.hidden=true;
-    label.textContent='';
-    chip.removeAttribute('title');
-    if(mobileAction){mobileAction.style.display='none';mobileAction.removeAttribute('title');}
-    if(mobileLabel) mobileLabel.textContent='';
+    clearProviderQuotaIndicator();
     return;
   }
   const text=_providerQuotaIndicatorText(status);
   if(!text||status.status!=='available'||(!status.quota&&!status.account_limits)){
-    chip.hidden=true;
-    label.textContent='';
-    chip.removeAttribute('title');
-    if(mobileAction){mobileAction.style.display='none';mobileAction.removeAttribute('title');}
-    if(mobileLabel) mobileLabel.textContent='';
+    clearProviderQuotaIndicator();
     return;
   }
   label.textContent=text.label;
   chip.title=text.title;
-  chip.hidden=false;
-  if(mobileAction){mobileAction.style.display='';mobileAction.title=text.title;}
   if(mobileLabel) mobileLabel.textContent=text.label;
+  if(mobileAction) mobileAction.title=text.title;
+  chip.hidden=false;
+  if(mobileAction) mobileAction.hidden=false;
 }
-async function refreshProviderQuotaIndicator(){
+async function refreshProviderQuotaIndicator(providerId){
+  const requestSeq=++_providerQuotaRefreshSeq;
+  const provider=String(providerId||'').trim();
+  const requestKey=_providerQuotaProfileKey()+'|'+provider;
+  // Clear before the request when the profile or provider changes, so the old account's numbers are not
+  // visible or keyboard-reachable meanwhile. A same-account refetch (session switch, tab return) keeps them.
+  // An unspecified provider means "the server's current default", which can change underneath, so it always clears.
+  if(!provider||requestKey!==_providerQuotaRenderedKey) clearProviderQuotaIndicator();
   // Short-circuit before the fetch when the chip is disabled — no point asking
   // the server for quota data the UI will throw away.
-  if(window._showQuotaChip!==true){
-    const chip=$('providerQuotaChip');
-    if(chip){chip.hidden=true;chip.removeAttribute('title');}
-    const mobileAction=$('composerMobileQuotaAction');
-    if(mobileAction){mobileAction.style.display='none';mobileAction.removeAttribute('title');}
-    const mobileLabel=$('composerMobileQuotaLabel');
-    if(mobileLabel) mobileLabel.textContent='';
-    return;
-  }
-  if(_providerQuotaRefreshInFlight) return;
-  _providerQuotaRefreshInFlight=true;
+  if(window._showQuotaChip!==true){clearProviderQuotaIndicator();return;}
+  const query=provider?'?provider='+encodeURIComponent(provider):'';
   try{
-    const status=await api('/api/provider/quota');
+    const status=await api('/api/provider/quota'+query);
+    if(requestSeq!==_providerQuotaRefreshSeq) return;
     renderProviderQuotaIndicator(status);
+    const chip=$('providerQuotaChip');
+    _providerQuotaRenderedKey=(chip&&!chip.hidden)?requestKey:null;
   }catch(_e){
-    renderProviderQuotaIndicator(null);
-  }finally{
-    _providerQuotaRefreshInFlight=false;
+    if(requestSeq!==_providerQuotaRefreshSeq) return;
+    clearProviderQuotaIndicator();
+  }
+}
+// Resolve the provider that should drive the composer quota request.
+// Prefers the active session's provider; when the composer is empty, falls
+// back to the retained empty-composer model override so a non-default provider
+// selected before opening a conversation still scopes the quota request.
+function _currentQuotaProvider(){
+  if(typeof S!=='undefined'&&S&&S.session){
+    return S.session.model_provider||null;
+  }
+  if(typeof _readEmptyComposerModelOverride==='function'){
+    const override=_readEmptyComposerModelOverride();
+    if(override&&override.model_provider) return override.model_provider;
+  }
+  return null;
+}
+// Keep account-quota state aligned with the authoritative session/composer
+// context without turning syncTopbar() into a high-frequency network poll.
+// Session identity is part of the key so switching between conversations is a
+// real refresh even when both use the same provider. Explicit visibility and
+// Settings refreshes intentionally bypass this de-duplication.
+function _syncProviderQuotaForActiveContext(){
+  if(typeof S==='undefined'||!S||S._bootReady!==true) return;
+  const provider=_currentQuotaProvider();
+  const providerIdentity=String(provider||'').trim();
+  // Quota is per profile (the route binds the profile env), so the active profile is part of the identity.
+  const profileIdentity='profile:'+_providerQuotaProfileKey()+'|';
+  const contextIdentity=profileIdentity+(S.session
+    ? 'session:'+String(S.session.session_id||'')+'|provider:'+providerIdentity
+    : 'composer|provider:'+providerIdentity);
+  if(contextIdentity===_providerQuotaContextIdentity) return;
+  _providerQuotaContextIdentity=contextIdentity;
+  if(typeof refreshProviderQuotaIndicator==='function'){
+    void refreshProviderQuotaIndicator(provider);
   }
 }
 window.addEventListener('visibilitychange',()=>{
-  if(document.visibilityState==='visible'&&typeof refreshProviderQuotaIndicator==='function') refreshProviderQuotaIndicator();
+  if(document.visibilityState==='visible'&&typeof refreshProviderQuotaIndicator==='function'){
+    void refreshProviderQuotaIndicator(_currentQuotaProvider());
+  }
 });
 
 // Dynamic model labels -- populated by populateModelDropdown(), fallback to static map
 let _dynamicModelLabels={};
 window._configuredModelBadges=window._configuredModelBadges||{};
+
+// ── Locale-independent model-id sort contract (#7528 round-3) ─────────────
+// Shared with api/config.py `_natural_model_id_key`: NO localeCompare, no
+// browser collation. Both sides run the identical token algorithm so ordering
+// is deterministic across Python/JS boundaries:
+//   1. lowercase the id;
+//   2. split into digit runs and text runs (/\d+|[^\d]+/g);
+//   3. digit vs digit: compare numeric value (strip leading zeros, compare
+//      core length then core text), tie-break on raw run text (007 vs 7);
+//   4. text vs text: compare Unicode code points;
+//   5. digit run sorts before text run at the same position;
+//   6. shorter run list sorts first when prefix-identical.
+function _modelPickerContractRuns(value){
+  return String(value==null?'':value).toLowerCase().match(/\d+|[^\d]+/g)||[];
+}
+function _modelPickerCompareRuns(a,b){
+  const ad=/^\d+$/.test(a), bd=/^\d+$/.test(b);
+  if(ad&&bd){
+    const ac=(a.replace(/^0+/,'')||'0'), bc=(b.replace(/^0+/,'')||'0');
+    if(ac.length!==bc.length) return ac.length<bc.length?-1:1;
+    if(ac!==bc) return ac<bc?-1:1;
+    if(a!==b) return a<b?-1:1;
+    return 0;
+  }
+  if(!ad&&!bd){
+    const la=[...a], lb=[...b];
+    const common=Math.min(la.length,lb.length);
+    for(let i=0;i<common;i++){
+      const ca=la[i].codePointAt(0), cb=lb[i].codePointAt(0);
+      if(ca!==cb) return ca<cb?-1:1;
+    }
+    if(la.length!==lb.length) return la.length<lb.length?-1:1;
+    return 0;
+  }
+  return ad?-1:1;
+}
+function _modelPickerCompareContract(a,b){
+  const ra=_modelPickerContractRuns(a), rb=_modelPickerContractRuns(b);
+  const common=Math.min(ra.length,rb.length);
+  for(let i=0;i<common;i++){
+    const c=_modelPickerCompareRuns(ra[i],rb[i]);
+    if(c!==0) return c;
+  }
+  if(ra.length!==rb.length) return ra.length<rb.length?-1:1;
+  return 0;
+}
+// Provider-routing prefix handling: when a provider context IS known, strip
+// ONLY the exact `@${provider}:` prefix (a bare split on ':' would eat a
+// legit model suffix such as `model-a:free`). When it isn't, the common
+// routing prefixes (@custom:, @provider:name:) are stripped once so named
+// custom IDs still sort on the underlying model id.
+function _modelPickerSortableId(entry,providerHint){
+  let value=String(entry&&entry.value!=null?entry.value:(entry&&entry.id!=null?entry.id:entry)||'');
+  const provider=String(
+    providerHint||
+    (entry&&entry.providerId)||
+    (entry&&entry.provider_id)||
+    (entry&&entry.parentElement&&entry.parentElement.dataset&&entry.parentElement.dataset.provider)||
+    ''
+  ).trim();
+  if(value.startsWith('@')){
+    if(provider){
+      const prefix=`@${provider}:`;
+      if(value.toLowerCase().startsWith(prefix.toLowerCase())) value=value.slice(prefix.length);
+      else{
+        // Known group provider but a different routed prefix (e.g. legacy
+        // alias) — drop the first routing segment conservatively.
+        const colon=value.indexOf(':');
+        if(colon>=0) value=value.slice(colon+1);
+      }
+    }else{
+      // No provider context: strip a single @...: routing segment so named
+      // custom ids (e.g. @custom:name:model-a:free → name:model-a:free) still
+      // compare on the part after the first colon, preserving model suffix
+      // colons. Mirrors _providerFromModelValue semantics.
+      const colon=value.indexOf(':');
+      if(colon>=0) value=value.slice(colon+1);
+    }
+  }
+  return value;
+}
+// Keep the historical name — populated by populateModelDropdown, fallback to static map
+function _modelPickerSortValue(entry,providerHint){
+  return _modelPickerSortableId(entry,providerHint);
+}
+function _compareModelPickerEntries(a,b,providerHint){
+  const av=_modelPickerSortableId(a,providerHint);
+  const bv=_modelPickerSortableId(b,providerHint);
+  const c=_modelPickerCompareContract(av,bv);
+  if(c!==0) return c;
+  // Deterministic tie-break on raw ids (provider-qualified included).
+  const rawA=String(a&&a.value!=null?a.value:(a&&a.id!=null?a.id:a)||'');
+  const rawB=String(b&&b.value!=null?b.value:(b&&b.id!=null?b.id:b)||'');
+  return _modelPickerCompareContract(rawA,rawB);
+}
+function _sortModelPickerEntries(items,providerHint){
+  return Array.from(items||[]).sort((a,b)=>_compareModelPickerEntries(a,b,providerHint));
+}
+function _sortModelPickerOptions(group){
+  if(!group||!group.children) return;
+  const select=group.closest?group.closest('select'):null;
+  // Moving <option> nodes re-parents them, and a <select> keeps its selection
+  // by VALUE, not by node. Reordering therefore resets `selectedIndex` to the
+  // first option whenever the selected value's node moves — so "Show all"
+  // followed by picking another model silently stayed on the old session model
+  // (the unchanged-selection early return then saw a different value). Restore
+  // by OBJECT, never by value: a value match can lose the provider identity of
+  // routed twins that share a bare model id.
+  let selectedOption=null;
+  if(select&&typeof select.selectedOptions!=='undefined'&&select.selectedOptions&&select.selectedOptions.length){
+    selectedOption=select.selectedOptions[0];
+  }
+  const options=Array.from(group.children).filter(option=>option&&option.tagName==='OPTION');
+  // #7528 owner option B: custom/aggregator groups (`custom`, `custom:<name>`)
+  // are natural-sorted whole. Built-in provider groups keep their curated
+  // catalog options in place and natural-sort only the appended `extra`
+  // options (live /v1/models rows, Show-more overflow) as one block after
+  // them. Mirrors api/config.py `_sort_picker_group_models`.
+  const _groupPid=String((group.dataset&&group.dataset.provider)||'').trim().toLowerCase();
+  const _isExtraOption=option=>!!(option.dataset&&option.dataset.extra);
+  const ordered=(_groupPid==='custom'||_groupPid.startsWith('custom:'))
+    ? _sortModelPickerEntries(options)
+    : options.filter(option=>!_isExtraOption(option)).concat(_sortModelPickerEntries(options.filter(_isExtraOption)));
+  if(typeof group.replaceChildren==='function'){
+    group.replaceChildren(...ordered);
+  }else if(Array.isArray(group.children)){
+    // Lightweight DOMs used by the picker regression driver expose children as
+    // an Array. Reorder that array directly so the fallback does not duplicate
+    // options by calling their simplified appendChild implementation.
+    group.children.splice(0,group.children.length,...ordered);
+    for(const option of ordered){
+      option.parentElement=group;
+      if('parentNode' in option) option.parentNode=group;
+    }
+  }else{
+    for(const option of ordered) group.appendChild(option);
+  }
+  if(select&&selectedOption){
+    // #7528 [CORE]: look the captured option up in the WHOLE select, not just
+    // this group. Sorting a second group re-orders its own <optgroup> and
+    // leaves the other groups' options in place, so a selection living in a
+    // different group is still in `select.options` but is no longer in
+    // `group.children` — the old membership check then cleared the selection.
+    const allOptions='options' in select?Array.from(select.options):Array.from(group.children);
+    if(allOptions.indexOf(selectedOption)>=0){
+      selectedOption.selected=true;
+      if('selectedIndex' in select) select.selectedIndex=allOptions.indexOf(selectedOption);
+    }else if('selectedIndex' in select){
+      select.selectedIndex=-1;
+    }
+  }else if(select&&'selectedIndex' in select){
+    // #7528 [SILENT]: a zero-add live refresh on an initially unselected
+    // picker must keep it unselected. `selectedOption` is null here, so the
+    // restore above is skipped entirely and the browser is free to keep (or
+    // adopt) whatever index the re-rendered options left behind — observed as
+    // selectedIndex=-1 becoming a real model, which a later Settings save then
+    // persists as the default. Master preserves the empty selection.
+    select.selectedIndex=-1;
+  }
+}
 const MODEL_STATE_KEY='hermes-webui-model-state';
 const PENDING_SESSION_MODEL_PREFIX='hermes-webui-pending-session-model:';
 const PENDING_SESSION_MODEL_MAX_AGE_MS=10*60*1000;
@@ -3389,6 +4663,10 @@ function _providerFromModelValue(modelId){
 function _modelPickerOptionIdentity(modelId, providerId){
   let value=String(modelId||'');
   const provider=String(providerId||'').trim();
+  if(provider.toLowerCase()==='openrouter'){
+    const prefix='@openrouter:';
+    return (value.toLowerCase().startsWith(prefix)?value.substring(prefix.length):value).toLowerCase();
+  }
   if(value.startsWith('@')&&value.includes(':')){
     const exactPrefix=provider ? `@${provider}:` : '';
     if(exactPrefix && value.toLowerCase().startsWith(exactPrefix.toLowerCase())){
@@ -3420,7 +4698,9 @@ function _deduplicateModelPickerOptions(sel,selectedValue){
     const options=Array.from(group.children||[]).filter(opt=>opt&&opt.tagName==='OPTION');
     const byIdentity=new Map();
     for(const opt of options){
-      const identity=_modelPickerOptionIdentity(opt.value,_getOptionProviderId(opt));
+      const provider=String(_getOptionProviderId(opt)||'').toLowerCase();
+      const value=String(opt.value||'');
+      const identity=_modelPickerOptionIdentity(value,provider);
       if(!identity) continue;
       if(!byIdentity.has(identity)) byIdentity.set(identity,[]);
       byIdentity.get(identity).push(opt);
@@ -3893,20 +5173,32 @@ function _findModelInDropdown(modelId, sel, preferredProviderId){
     explicitProvider=rawModel.slice(1,rawModel.lastIndexOf(':'));
   }
   const preferred=String(preferredProviderId||explicitProvider||'').toLowerCase();
+  const isOpenRouterRoute=preferred==='openrouter'&&(rawModel.includes('/')||rawModel.startsWith('@'));
   if(preferred){
-    if(preferred==='custom'||preferred.startsWith('custom:')){
-      // A slash is part of a custom endpoint's upstream model ID, not a
-      // provider namespace. Match the exact routed ID (allowing only the
-      // WebUI's @provider: wrapper and dash/dot spelling compatibility).
+    if(isOpenRouterRoute||preferred==='custom'||preferred.startsWith('custom:')){
+      // Match the full routed ID. OpenRouter's slash IDs are exact; custom
+      // providers retain their legacy dash/dot spelling compatibility.
       const routeNorm=value=>{
         let routed=String(value||'');
         const prefix=`@${preferred}:`;
         if(routed.toLowerCase().startsWith(prefix)) routed=routed.slice(prefix.length);
-        return routed.toLowerCase().replace(/-/g,'.');
+        const normalized=routed.toLowerCase();
+        return isOpenRouterRoute?normalized:normalized.replace(/-/g,'.');
       };
       const providerOptions=options.filter(o=>_getOptionProviderId(o).toLowerCase()===preferred);
+      if(isOpenRouterRoute){
+        const exactRoute=value=>{
+          let routed=String(value||'');
+          const prefix=`@${preferred}:`;
+          if(routed.toLowerCase().startsWith(prefix.toLowerCase())) routed=routed.slice(prefix.length);
+          return routed.toLowerCase();
+        };
+        const exactProviderMatch=providerOptions.find(o=>exactRoute(o.value)===exactRoute(rawModel));
+        if(exactProviderMatch) return exactProviderMatch.value;
+      }
       const providerMatch=providerOptions.find(o=>routeNorm(o.value)===routeNorm(rawModel));
       if(providerMatch) return providerMatch.value;
+      if(isOpenRouterRoute) return null;
       // Legacy sessions may store only the bare suffix of a routed custom
       // option. Preserve #6195's provider-hinted repair, but only for an
       // explicit @provider: row; an unwrapped slash ID belongs to the active
@@ -4043,6 +5335,40 @@ function _ensureModelOptionInDropdown(modelId, sel, preferredProviderId){
       :{model:applied,model_provider:null};
     if(!requestedProvider||String(appliedState&&appliedState.model_provider||'').toLowerCase()===requestedProvider.toLowerCase()) return applied;
   }
+  if(requestedProvider.toLowerCase()==='openrouter'&&typeof _readModelOverflowData==='function'&&sel.querySelectorAll){
+    const prefix=`@${requestedProvider}:`;
+    const routeKey=value=>{
+      let id=String(value||'');
+      if(id.toLowerCase().startsWith(prefix.toLowerCase())) id=id.slice(prefix.length);
+      return id.toLowerCase();
+    };
+    const target=routeKey(modelId);
+    for(const group of Array.from(sel.querySelectorAll('optgroup'))){
+      if(String(group.dataset&&group.dataset.provider||'').toLowerCase()!==requestedProvider.toLowerCase()) continue;
+      const extra=_readModelOverflowData(group);
+      const matches=extra.map((item,index)=>({item,index})).filter(entry=>routeKey(entry.item.id)===target);
+      const match=matches.find(entry=>String(entry.item.id)===String(modelId))||(matches.length===1?matches[0]:null);
+      if(!match) continue;
+      const opt=document.createElement('option');
+      opt.value=match.item.id;
+      opt.textContent=match.item.label||(typeof getModelLabel==='function'?getModelLabel(opt.value):opt.value);
+      if(String(opt.value).toLowerCase().startsWith(prefix.toLowerCase())){
+        opt.dataset.model=String(opt.value).slice(prefix.length);
+        opt.dataset.provider=requestedProvider;
+      }
+      // A restored overflow row is still an overflow ("extra") row: #7528 sorts a built-in group's curated rows
+      // first and natural-sorts extras after them, so an untagged restore would jump ahead of its siblings.
+      opt.dataset.extra='1';
+      group.appendChild(opt);
+      group.dataset.extraModels=JSON.stringify(extra.filter((_,index)=>index!==match.index));
+      const restored=_applyModelToDropdown(modelId,sel,requestedProvider);
+      if(restored){
+        const state=_modelStateForSelect(sel,restored);
+        if(String(state&&state.model_provider||'').toLowerCase()===requestedProvider.toLowerCase()) return restored;
+      }
+      break;
+    }
+  }
   const explicitPrefix=requestedProvider?`@${requestedProvider}:`:'';
   const rawModel=String(modelId||'');
   const bareModel=explicitPrefix&&rawModel.toLowerCase().startsWith(explicitPrefix.toLowerCase())
@@ -4133,6 +5459,52 @@ async function populateModelDropdown(opts={}){
     window._defaultModel=data.default_model||null;
     window._configuredModelBadges=data.configured_model_badges||{};
     window._modelEndpointErrors={};
+    const _sortModelEntries=(items,providerId)=>{
+      const values=Array.from(items||[]);
+      if(typeof _sortModelPickerEntries==='function') return _sortModelPickerEntries(values,providerId);
+      // Minimal self-contained fallback for bare single-function eval harnesses
+      // (test_4737) that lack module-level picker helpers: never reference them
+      // here, and keep the body short so contract-sniffing tests that window
+      // the first chars of populateModelDropdown still see extra_models (#1567).
+      // The fallback must stay locale-INDEPENDENT: no `localeCompare(numeric:true)`,
+      // because the browser collation would tokenize digits under the host
+      // locale and can disagree with the Python ``_natural_model_id_key``
+      // backend (review blocker 3, 2026-09-19). When the contract function
+      // is in scope, delegate to it; otherwise do a deterministic ASCII-aware
+      // [0-9] run split that matches the shared contract tokenization.
+      const _compare=(a,b)=>{
+        if(typeof _modelPickerCompareContract==='function'){
+          return _modelPickerCompareContract(String(a||''),String(b||''));
+        }
+        const _runs=(s)=>String(s||'').toLowerCase().match(/[0-9]+|[^0-9]+/g)||[];
+        const _cmpRuns=(x,y)=>{
+          const _xd=/^[0-9]+$/.test(x), _yd=/^[0-9]+$/.test(y);
+          if(_xd&&_yd){
+            const _xc=(x.replace(/^0+/,'')||'0'), _yc=(y.replace(/^0+/,'')||'0');
+            if(_xc.length!==_yc.length) return _xc.length<_yc.length?-1:1;
+            if(_xc!==_yc) return _xc<_yc?-1:1;
+            if(x!==y) return x<y?-1:1;
+            return 0;
+          }
+          if(!_xd&&!_yd){
+            if(x<y) return -1; if(x>y) return 1; return 0;
+          }
+          return _xd?-1:1;
+        };
+        const _ra=_runs(a), _rb=_runs(b);
+        const _common=Math.min(_ra.length,_rb.length);
+        for(let _i=0;_i<_common;_i++){
+          const _c=_cmpRuns(_ra[_i],_rb[_i]);
+          if(_c!==0) return _c;
+        }
+        if(_ra.length!==_rb.length) return _ra.length<_rb.length?-1:1;
+        return 0;
+      };
+      return values.sort((a,b)=>{
+        const _aid=String(a&&a.id!=null?a.id:a||''), _bid=String(b&&b.id!=null?b.id:b||'');
+        return _compare(_aid,_bid);
+      });
+    };
     // Keep g.extra_models label hydration in this function for /model and tail selections.
 
     const _synthGroupsFromConfigured=()=>{
@@ -4197,7 +5569,11 @@ async function populateModelDropdown(opts={}){
         og.dataset.modelsEndpointError=JSON.stringify(g.models_endpoint_error);
         if(errorKey) window._modelEndpointErrors[errorKey]=g.models_endpoint_error;
       }
-      for(const m of (Array.isArray(g.models)?g.models:[])){
+      // #7528 owner option B: only custom/aggregator groups are re-sorted;
+      // built-in groups keep the curated catalog order the API shipped.
+      const _gPid=String(g.provider_id||'').trim().toLowerCase();
+      const _gModels=Array.isArray(g.models)?g.models:[];
+      for(const m of ((_gPid==='custom'||_gPid.startsWith('custom:'))?_sortModelEntries(_gModels,g.provider_id):_gModels)){
         const opt=document.createElement('option');
         opt.value=m.id;
         opt.textContent=m.label;
@@ -4281,25 +5657,7 @@ function _addLiveModelsToSelect(provider, models, sel){
   const _isNamedCustomActiveProvider=_ap.startsWith('custom:');
   const _isPortalFetch=_ap && _ap!=='openrouter' && _ap!=='custom' && _ap!=='openai-codex' && (_providerLower===_ap||_isNamedCustomActiveProvider&&_providerLower===_ap);
   // Keep existingNorm.has( within the #907 source slice.
-  const optionIdentity=typeof _modelPickerOptionIdentity==='function'
-    ? (modelId,providerId)=>_modelPickerOptionIdentity(modelId,providerId)
-    : (modelId,providerId)=>{
-        let value=String(modelId||'');
-        const provider=String(providerId||'').trim();
-      if(value.startsWith('@')&&value.includes(':')){
-        const exactPrefix=provider ? `@${provider}:` : '';
-        if(exactPrefix && value.toLowerCase().startsWith(exactPrefix.toLowerCase())){
-          value=value.substring(exactPrefix.length);
-        }else if(value.startsWith('@custom:')){
-          const namedProvider=value.substring('@custom:'.length);
-          const splitAt=namedProvider.indexOf(':');
-          value=splitAt>=0 ? namedProvider.substring(splitAt+1) : namedProvider;
-        }else{
-          value=value.substring(value.indexOf(':')+1);
-        }
-      }
-        return value.split('/').pop().replace(/-/g,'.').toLowerCase();
-      };
+  const optionIdentity=_modelPickerOptionIdentity;
   const existingNorm=new Set([...sel.options].map(o=>optionIdentity(o.value,_getOptionProviderId(o))));
   let added=0;
   for(const m of models){
@@ -4309,12 +5667,14 @@ function _addLiveModelsToSelect(provider, models, sel){
     }
     if(existingIds.has(mid)) continue;
     const identity=optionIdentity(mid,provider);
+    let twin=null;
     if(existingNorm.has(identity)){
       const sameGroup=Array.from(providerGroup.children||[]).find(o=>optionIdentity(o.value,_getOptionProviderId(o))===identity);
       if(sameGroup){
         const incomingRoutable=String(mid).startsWith('@');
         const existingRoutable=String(sameGroup.value||'').startsWith('@');
         if(!(!existingRoutable&&incomingRoutable)) continue; // let proxy replace catalog twin
+        twin=sameGroup;
       }
     }
     const opt=document.createElement('option');
@@ -4327,13 +5687,26 @@ function _addLiveModelsToSelect(provider, models, sel){
     }else if(m && (m.supports_fast_tier === false || String(m.supports_fast_tier).toLowerCase()==='false')){
       opt.dataset.fast='0';
     }
-    providerGroup.appendChild(opt);
+    if(twin){
+      // A routed replacement for a catalog twin takes the twin's place and its
+      // curated/extra status (#7528 option B): dedup then drops the bare twin,
+      // so a built-in group keeps its curated order instead of the replacement
+      // being sorted into the extras block.
+      if(twin.dataset&&twin.dataset.extra) opt.dataset.extra='1';
+      providerGroup.insertBefore(opt,twin);
+    }else{
+      // Not part of the group's curated `models` list: _sortModelPickerOptions
+      // sorts these after the catalog rows of a built-in group (#7528 option B).
+      opt.dataset.extra='1';
+      providerGroup.appendChild(opt);
+    }
     existingIds.add(mid);
     existingNorm.add(identity);
     _dynamicModelLabels[mid]=m.label||m.id;
     added++;
   }
   if(typeof _deduplicateModelPickerOptions==='function') _deduplicateModelPickerOptions(sel,currentVal);
+  if(typeof _sortModelPickerOptions==='function') _sortModelPickerOptions(providerGroup);
   const currentState=(currentVal&&typeof _modelStateForSelect==='function')
     ? _modelStateForSelect(sel, currentVal)
     : {model:currentVal||'', model_provider:(S.session&&S.session.model_provider)||null};
@@ -4714,9 +6087,16 @@ function _positionModelDropdown(){
 
 function _readModelOverflowData(group){
   if(!group||!group.dataset||!group.dataset.extraModels) return [];
+  const _sortOverflowModels=(items)=>{
+    const providerId=(group.dataset&&group.dataset.provider)||'';
+    if(typeof _sortModelPickerEntries==='function') return _sortModelPickerEntries(items,providerId);
+    return Array.from(items||[]).sort((a,b)=>_modelPickerCompareContract(String(a&&a.id||''),String(b&&b.id||'')));
+  };
   try{
     const parsed=JSON.parse(group.dataset.extraModels);
-    return Array.isArray(parsed)?parsed.filter(m=>m&&m.id):[];
+    if(!Array.isArray(parsed)) return [];
+    const models=parsed.filter(m=>m&&m.id);
+    return _sortOverflowModels(models);
   }catch(_e){
     return [];
   }
@@ -4742,11 +6122,15 @@ function _appendOverflowOptionsToGroup(group, extraModels){
     if(existing){
       // Move the already-present option into this group rather than duplicating it.
       if(existing.parentNode!==group) group.appendChild(existing);
+      if(existing.dataset) existing.dataset.extra='1';
       continue;
     }
     const opt=document.createElement('option');
     opt.value=m.id;
     opt.textContent=m.label||m.id;
+    // Overflow rows come from `extra_models`, not the curated `models` list
+    // (#7528 option B: sorted after a built-in group's catalog rows).
+    if(opt.dataset) opt.dataset.extra='1';
     group.appendChild(opt);
     appended++;
   }
@@ -4754,6 +6138,7 @@ function _appendOverflowOptionsToGroup(group, extraModels){
     group.dataset.extraModels='[]';
     group.dataset.overflowExpanded='1';
   }
+  if(typeof _sortModelPickerOptions==='function') _sortModelPickerOptions(group);
   return appended;
 }
 
@@ -4903,6 +6288,78 @@ function renderModelDropdown(){
   const _groupMeta=new Map();
   const _groupOrder=[];
   const _badgeMap=window._configuredModelBadges||{};
+  const _sortPickerEntries=typeof _sortModelPickerEntries==='function'
+    ? _sortModelPickerEntries
+    : (items)=>Array.from(items||[]).sort((a,b)=>{
+        const valueOf=(entry)=>{
+          let value=String(entry&&entry.value!=null?entry.value:(entry&&entry.id!=null?entry.id:entry)||'');
+          const provider=String(entry&&entry.providerId||'').trim();
+          if(value.startsWith('@')){
+            const prefix=provider?`@${provider}:`:'';
+            if(prefix&&value.toLowerCase().startsWith(prefix.toLowerCase())) value=value.slice(prefix.length);
+            else if(value.includes(':')) value=value.slice(value.indexOf(':')+1);
+          }
+          return value;
+        };
+        const av=valueOf(a);
+        const bv=valueOf(b);
+        // Locale-INDEPENDENT comparator contract — no localeCompare(numeric:true)
+        // here, because the browser collation would tokenize digits under the
+        // host locale and could disagree with the Python backend
+        // ``_natural_model_id_key`` (review blocker 3, 2026-09-19). When the
+        // contract function is in scope, delegate to it; otherwise inline the
+        // shared [0-9] run split so an isolated eval harness still tokenizes
+        // identically to the Python side.
+        const _contract=typeof _modelPickerCompareContract==='function'
+          ? _modelPickerCompareContract
+          : null;
+        if(_contract){
+          const rawA=String(a&&a.value!=null?a.value:(a&&a.id!=null?a.id:a)||'');
+          const rawB=String(b&&b.value!=null?b.value:(b&&b.id!=null?b.id:b)||'');
+          return _contract(av,bv)||_contract(rawA,rawB);
+        }
+        const _runs=(s)=>String(s||'').toLowerCase().match(/[0-9]+|[^0-9]+/g)||[];
+        const _cmpRuns=(x,y)=>{
+          const _xd=/^[0-9]+$/.test(x), _yd=/^[0-9]+$/.test(y);
+          if(_xd&&_yd){
+            const _xc=(x.replace(/^0+/,'')||'0'), _yc=(y.replace(/^0+/,'')||'0');
+            if(_xc.length!==_yc.length) return _xc.length<_yc.length?-1:1;
+            if(_xc!==_yc) return _xc<_yc?-1:1;
+            if(x!==y) return x<y?-1:1;
+            return 0;
+          }
+          if(!_xd&&!_yd){
+            if(x<y) return -1; if(x>y) return 1; return 0;
+          }
+          return _xd?-1:1;
+        };
+        const _cmpStr=(p,q)=>{
+          const _rp=_runs(p), _rq=_runs(q);
+          const _common=Math.min(_rp.length,_rq.length);
+          for(let _i=0;_i<_common;_i++){
+            const _c=_cmpRuns(_rp[_i],_rq[_i]);
+            if(_c!==0) return _c;
+          }
+          if(_rp.length!==_rq.length) return _rp.length<_rq.length?-1:1;
+          return 0;
+        };
+        const rawA=String(a&&a.value!=null?a.value:(a&&a.id!=null?a.id:a)||'');
+        const rawB=String(b&&b.value!=null?b.value:(b&&b.id!=null?b.id:b)||'');
+        return _cmpStr(av,bv)||_cmpStr(rawA,rawB);
+      });
+  // #7528 owner option B — WHERE the comparator applies (mirrors
+  // _sortModelPickerOptions and api/config.py `_sort_picker_group_models`):
+  // custom/aggregator groups (`custom`, `custom:<name>`) are natural-sorted
+  // whole; built-in provider groups keep their curated rows in catalog order
+  // and natural-sort only their `extra` rows (Show-more overflow, live
+  // /v1/models additions) as one block after them.
+  const _sortsWholeGroup=(providerId)=>{
+    const pid=String(providerId||'').trim().toLowerCase();
+    return pid==='custom'||pid.startsWith('custom:');
+  };
+  const _orderGroupRows=(rows,providerId)=>_sortsWholeGroup(providerId)
+    ? _sortPickerEntries(rows)
+    : rows.filter(m=>!m.extra).concat(_sortPickerEntries(rows.filter(m=>m.extra)));
   const _ensureGroupMeta=(groupKey,groupLabel,providerId,optgroup)=>{
     if(!_groupMeta.has(groupKey)){
       _groupMeta.set(groupKey,{
@@ -4941,7 +6398,7 @@ function renderModelDropdown(){
         const displayName=rawValue.startsWith('@custom:')
           ? getModelLabel(rawValue)
           : (opt.textContent||getModelLabel(rawValue));
-        const entry={value:opt.value,name:esc(displayName),id:esc(opt.value),group:child.label||'',groupKey,providerId,modelsEndpointError,badge:_getConfiguredModelBadge(opt.value,_badgeMap,providerId),hiddenByDefault:false};
+        const entry={value:opt.value,name:esc(displayName),id:esc(opt.value),group:child.label||'',groupKey,providerId,modelsEndpointError,badge:_getConfiguredModelBadge(opt.value,_badgeMap,providerId),hiddenByDefault:false,extra:!!(opt.dataset&&opt.dataset.extra)};
         _modelData.push(entry);
         groupMeta.modelCount++;
       }
@@ -4959,6 +6416,7 @@ function renderModelDropdown(){
           modelsEndpointError,
           badge:_getConfiguredModelBadge(overflowModel.id,_badgeMap,providerId),
           hiddenByDefault:true,
+          extra:true,
         });
         groupMeta.modelCount++;
         groupMeta.hiddenCount++;
@@ -5144,6 +6602,62 @@ function renderModelDropdown(){
       // just asked to see more of it) regardless of any prior collapsed state.
       moreEl.remove();
       wrap.style.display='';
+      // Global group re-sort: the in-place reveal above appends overflow rows
+      // before the expander, but every already-visible row keeps its old slot
+      // — so a sorted visible head followed by a sorted overflow tail would
+      // not be globally ordered ([z-*] visible … [a-*] revealed). Re-position
+      // ALL `.model-opt` rows of the group in one picker-order pass so the
+      // fully expanded group follows the option-B order below (#7528).
+      // GUARD: a subgrouped group (OpenRouter/Nous with >= SUB_GROUP_MIN_MODELS
+      // visible rows) nests rows inside `.model-group-body.sub` wrappers. The
+      // in-place re-sort collects rows via `wrap.querySelectorAll('.model-opt')`
+      // and `wrap.appendChild(...)` MOVES them into the outer wrapper, emptying
+      // the subgroup bodies. Subgrouped groups need the full re-render path so
+      // the existing partition/renderer re-creates the per-prefix bodies
+      // (review blocker 1, 2026-09-19). Flat groups keep the in-place path
+      // because it's a cheap contiguous-ordering pass and preserves scroll
+      // position / group-open state across show-more.
+      const _hasSubgroupBodies=!!(wrap.querySelector&&wrap.querySelector('.model-group-body.sub'));
+      if(_hasSubgroupBodies){
+        // Persist the user's "show more" intent on the global cross-render
+        // force-open set BEFORE the full re-render. `_groupOpenState` is
+        // rebuilt per render and defaults to collapsed for a non-selected
+        // group, so without this add the re-render would re-collapse the
+        // just-revealed group and hide the overflow rows the user asked
+        // for (greptile P1 "Expanded group closes again", 2026-09-26).
+        _forceOpenGroups.add(groupKey);
+        _fullReRender();
+        return;
+      }
+      try{
+        const _allRows=Array.from(wrap.querySelectorAll('.model-opt'));
+        const _rowIds=[];
+        for(const _r of _allRows){
+          const _idEl=_r.querySelector('.model-opt-id');
+          const _id=_idEl?_idEl.textContent:'';
+          if(_id) _rowIds.push({row:_r,id:_id});
+        }
+        if(_rowIds.length>1){
+          const _groupProvider=(og.dataset&&og.dataset.provider)||'';
+          const _cmpRows=(x,y)=>{
+            const xKV=x.id.startsWith('@')?{id:x.id,providerId:_groupProvider}:{id:x.id};
+            const yKV=y.id.startsWith('@')?{id:y.id,providerId:_groupProvider}:{id:y.id};
+            return _compareModelPickerEntries(xKV,yKV,_groupProvider);
+          };
+          // #7528 owner option B: a built-in group keeps its curated rows in
+          // place and sorts only its extra rows (revealed overflow + live
+          // /v1/models rows) as one block after them; custom groups re-sort whole.
+          const _extraIds=new Set();
+          for(const _md of _modelData){
+            if(_md&&_md.groupKey===groupKey&&_md.extra){ _extraIds.add(_md.id); _extraIds.add(_md.value); }
+          }
+          const _isExtraRow=_pair=>_extraIds.has(_pair.id);
+          const _orderedRows=_sortsWholeGroup(_groupProvider)
+            ? _rowIds.sort(_cmpRows)
+            : _rowIds.filter(_pair=>!_isExtraRow(_pair)).concat(_rowIds.filter(_isExtraRow).sort(_cmpRows));
+          for(const _pair of _orderedRows) wrap.appendChild(_pair.row);
+        }
+      }catch(_se){ /* keep revealed rows even if re-sort fails */ }
       _forceOpenGroups.add(groupKey);
       const heading=wrap.previousElementSibling;
       if(heading&&heading.classList&&heading.classList.contains('model-group')){
@@ -5156,7 +6670,7 @@ function renderModelDropdown(){
       // not be reset to the top of the list and not have it jump unpredictably.
       if(firstNewRow && typeof firstNewRow.offsetTop==='number' && typeof requestAnimationFrame==='function'){
         const _targetTop=Math.max(0,firstNewRow.offsetTop-48);
-        const _doScroll=()=>{ try{ dd.scrollTop=_targetTop; }catch(_){} };
+        const _doScroll=()=>{ try{ dd.scrollTop=_targetTop;if(typeof _nudgeModelRowBelowStickyStack==='function') _nudgeModelRowBelowStickyStack(dd,firstNewRow); }catch(_){} };
         _doScroll();                                   // immediate
         requestAnimationFrame(()=>{ _doScroll(); requestAnimationFrame(_doScroll); });
         if(typeof setTimeout==='function') setTimeout(_doScroll,80); // after any refocus settles
@@ -5299,13 +6813,13 @@ function renderModelDropdown(){
       const meta=_groupMeta.get(groupKey);
       if(!meta) continue;
       const hiddenCount=_effectiveHiddenCount(groupKey);
-      const groupRows=_modelData.filter(m=>
+      const groupRows=_orderGroupRows(_modelData.filter(m=>
         m.groupKey===groupKey
         && !configuredIds.has(m.value)
         && !m.endpointErrorOnly
         && matches(m)
         && (!m.hiddenByDefault || !!term)
-      );
+      ),meta.providerId);
       const shouldRenderHeading=!!meta.label&&(groupRows.length||meta.endpointErrorOnly||(!term&&hiddenCount));
       if(shouldRenderHeading){
         const heading=document.createElement('div');
@@ -5317,7 +6831,18 @@ function renderModelDropdown(){
         // so hoisted-configured models aren't double-counted. (#3691)
         const count=hiddenCount?0:groupRows.length;
         const _plainLabel=String(meta.label||'').replace(/\s*\(\d+\s+of\s+\d+\)\s*$/,'');
-        heading.textContent=count>1?`${_plainLabel} (${count})`:meta.label;
+        // The backend's "(a of b)" is fixed at load time. Restoring an overflow model
+        // moves it from the hidden tail into the group, so recompute "a" from what is
+        // still hidden; otherwise the collapsed heading undercounts the rows below it.
+        let collapsedLabel=meta.label;
+        const _ofMatch=hiddenCount?String(meta.label||'').match(/\((\d+)\s+of\s+(\d+)\)\s*$/):null;
+        if(_ofMatch){
+          const total=Number(_ofMatch[2]);
+          const stillHidden=_modelData.filter(m=>m.groupKey===groupKey&&m.hiddenByDefault).length;
+          const shown=Math.max(0,Math.min(total,total-stillHidden));
+          if(shown!==Number(_ofMatch[1])) collapsedLabel=`${_plainLabel} (${shown} of ${total})`;
+        }
+        heading.textContent=count>1?`${_plainLabel} (${count})`:collapsedLabel;
         dd.appendChild(heading);
         const wrapper=document.createElement('div');
         wrapper.className='model-group-body';
@@ -5369,6 +6894,7 @@ function renderModelDropdown(){
             return b[1].length-a[1].length;
           });
           for(const [pfx,pfxRows] of sorted){
+            const orderedPrefixRows=_orderGroupRows(pfxRows,meta.providerId);
             if(pfxRows.length>=2){
               const subKey=`${groupKey}::${pfx}`;
               if(!(subKey in _groupOpenState)) _groupOpenState[subKey]=true;
@@ -5391,9 +6917,9 @@ function renderModelDropdown(){
               });
               wrapper.appendChild(subHeading);
               wrapper.appendChild(subWrapper);
-              for(const m of pfxRows) subWrapper.appendChild(_makeModelRow(m,shouldRenderHeading));
+              for(const m of orderedPrefixRows) subWrapper.appendChild(_makeModelRow(m,shouldRenderHeading));
             } else {
-              for(const m of pfxRows) wrapper.appendChild(_makeModelRow(m,shouldRenderHeading));
+              for(const m of orderedPrefixRows) wrapper.appendChild(_makeModelRow(m,shouldRenderHeading));
             }
           }
         } else {
@@ -5457,6 +6983,7 @@ function renderModelDropdown(){
     const row=rows[idx];
     row.classList.add('is-highlighted');
     if(typeof row.scrollIntoView==='function') row.scrollIntoView({block:'nearest'});
+    if(typeof _nudgeModelRowBelowStickyStack==='function') _nudgeModelRowBelowStickyStack(dd,row);
   };
   _si.addEventListener('keydown',e=>{
     if(e.key==='Escape'){closeDropdown();return;}
@@ -5518,6 +7045,26 @@ async function selectModelFromDropdown(value){
   if(typeof sel.onchange==='function') await sel.onchange();
 }
 
+// The scope note and the search row are both sticky. Measure the live note
+// height (it wraps to two lines in longer locales / narrow sheets) so the
+// search row pins exactly under the note instead of a hard-coded 34px.
+function _syncModelDropdownStickyInsets(dd){
+  if(!dd||typeof dd.querySelector!=='function'||!dd.style) return;
+  const note=dd.querySelector('.model-scope-note');
+  const noteH=(note&&typeof note.getBoundingClientRect==='function')?Math.floor(note.getBoundingClientRect().height):0;
+  if(typeof dd.style.setProperty==='function') dd.style.setProperty('--model-scope-note-h',noteH+'px');
+}
+// scrollIntoView does not know about the pinned note + search stack, so a
+// nearest-scroll (arrow keys) or a clamped centre-scroll (open) can park the
+// row underneath it. Nudge the list so the row's top clears the stack; no-op
+// when it already does.
+function _nudgeModelRowBelowStickyStack(dd,row){
+  if(!dd||!row||typeof row.getBoundingClientRect!=='function'||typeof dd.querySelector!=='function') return;
+  const bottomOf=(el)=>(el&&typeof el.getBoundingClientRect==='function')?el.getBoundingClientRect().bottom:0;
+  const stack=Math.max(bottomOf(dd.querySelector('.model-scope-note')),bottomOf(dd.querySelector('.model-search-row')));
+  const top=row.getBoundingClientRect().top;
+  if(top<stack) dd.scrollTop-=Math.ceil(stack-top);
+}
 async function toggleModelDropdown(){
   const dd=$('composerModelDropdown');
   const chip=$('composerModelChip');
@@ -5537,8 +7084,10 @@ async function toggleModelDropdown(){
   renderModelDropdown();
   dd.classList.add('open');
   _positionModelDropdown();
+  _syncModelDropdownStickyInsets(dd);
   const activeRow=dd.querySelector('.model-opt.active');
-  if(activeRow&&typeof activeRow.scrollIntoView==='function') activeRow.scrollIntoView({block:'nearest'});
+  if(activeRow&&typeof activeRow.scrollIntoView==='function') activeRow.scrollIntoView({block:'center'});
+  _nudgeModelRowBelowStickyStack(dd,activeRow);
   chip.classList.add('active');
   const mobileAction=$('composerMobileModelAction');
   if(mobileAction) mobileAction.classList.add('active');
@@ -5667,7 +7216,12 @@ document.addEventListener('click',e=>{
 });
 window.addEventListener('resize',()=>{
   const dd=$('composerModelDropdown');
-  if(dd&&dd.classList.contains('open')) _positionModelDropdown();
+  if(dd&&dd.classList.contains('open')){
+    _positionModelDropdown();
+    // The scope note re-wraps at a new width, so its measured height (and the
+    // search row's sticky offset) must be recomputed on every resize.
+    if(typeof _syncModelDropdownStickyInsets==='function') _syncModelDropdownStickyInsets(dd);
+  }
   // Keep the reasoning dropdown aligned under its chip when the window
   // resizes while open — same pattern as the model dropdown above.
   const rdd=$('composerReasoningDropdown');
@@ -5688,7 +7242,12 @@ function _repositionOpenModelDropdown(){
   requestAnimationFrame(()=>{
     _modelDropdownRepositionScheduled=false;
     const openDd=$('composerModelDropdown');
-    if(openDd&&openDd.classList.contains('open')) _positionModelDropdown();
+    if(openDd&&openDd.classList.contains('open')){
+      _positionModelDropdown();
+      // A rotation / keyboard-open can also re-wrap the scope note, so refresh
+      // the sticky inset here too (same reason as the resize handler above).
+      if(typeof _syncModelDropdownStickyInsets==='function') _syncModelDropdownStickyInsets(openDd);
+    }
   });
 }
 if(window.visualViewport){
@@ -5712,6 +7271,15 @@ function _fitComposerFooter(){
   if(!left) return;
   if(!left.clientWidth) return;
   const overflows=function(){return left.scrollWidth>left.clientWidth+1;};
+  // Burger-mode cleanup trigger: cf-burger can flip WITHOUT any 640px
+  // boundary crossing (this fit path measures real overflow at any width,
+  // e.g. a constant 760px viewport). CSS hides the inline model/reasoning/
+  // toolset anchors in burger mode and reveals the shared mobile config
+  // button/panel, so an open dropdown would outlive its hidden anchor.
+  // Capture the pre-measurement burger state and fire the composer menu
+  // cleanup when it actually TRANSITIONS — not on every fit pass, so
+  // mutation-driven refits with unchanged geometry remain harmless.
+  const wasBurger=footer.classList.contains('cf-burger');
   // Measure without ever PAINTING the expanded state. Stripping the stage
   // classes makes the footer briefly full-width, which grows the composer and
   // shrinks #messages by a few px; restoring them a moment later shrinks it
@@ -5746,6 +7314,14 @@ function _fitComposerFooter(){
       footer.style.height=prevHeight;
       footer.style.visibility=prevVisibility;
     }
+  }
+  // Post-restore transition check: fire the same composer menu cleanup used
+  // by the 640px MediaQueryList boundary listener (see _onPhoneBoundaryChange
+  // above). Both burger transitions (entering and leaving) close — the same
+  // deterministic both-directions policy as the boundary listener.
+  const isBurger=next.includes('cf-burger');
+  if(isBurger!==wasBurger && typeof _onPhoneBoundaryChange==='function'){
+    try{ _onPhoneBoundaryChange(); }catch(_){ }
   }
 }
 window._fitComposerFooter=_fitComposerFooter;
@@ -6504,14 +8080,39 @@ document.addEventListener('keydown',function(e){
   closeReasoningDropdown();
 });
 
-window.addEventListener('resize',function(){
-  if(window.matchMedia && !window.matchMedia('(max-width: 640px)').matches){
-    closeMobileComposerConfig();
-    closeModelDropdown();
-    closeReasoningDropdown();
-    if(typeof closeWsDropdown==='function') closeWsDropdown();
+// Close phone-mode composer state when the phone/desktop boundary (640px) is
+// actually CROSSED — not on every window resize. Keyboard-induced resizes
+// (on-screen keyboard opening/closing on compact touch devices, e.g. the
+// Pixel Fold inner screen at ~804px) resize the visual viewport and fire a
+// window resize, which previously slammed an open model dropdown shut the
+// moment the user tapped the model search input. A MediaQueryList change
+// listener fires only when the (max-width:640px) match itself flips, so it
+// cannot fire for a keyboard-only height change, and it has no uninitialized
+// first-event state (the first boundary crossing after page load is still
+// delivered). Same pattern as static/pwa-startup.js:37-44.
+//
+// Direction policy: close on BOTH crossings (fold AND unfold). Upstream
+// previously closed only when leaving phone mode; closing when entering it
+// too is intentional — the phone layout's mobile drawer owns the sidebar and
+// the composer footer switches to the mobile config panel, so any desktop
+// dropdown state left open across a fold would render against the wrong
+// layout. Both directions reset the composer menu family deterministically.
+const _phoneWidthQuery=(typeof window!=='undefined'&&window.matchMedia)
+  ? window.matchMedia('(max-width: 640px)')
+  : null;
+function _onPhoneBoundaryChange(){
+  closeMobileComposerConfig();
+  closeModelDropdown();
+  closeReasoningDropdown();
+  if(typeof closeWsDropdown==='function') closeWsDropdown();
+}
+if(_phoneWidthQuery){
+  if(typeof _phoneWidthQuery.addEventListener==='function'){
+    _phoneWidthQuery.addEventListener('change',_onPhoneBoundaryChange);
+  }else if(typeof _phoneWidthQuery.addListener==='function'){
+    _phoneWidthQuery.addListener(_onPhoneBoundaryChange);
   }
-});
+}
 
 // ── Scroll pinning ──────────────────────────────────────────────────────────
 // When streaming, auto-scroll only while the user is following the live tail.
@@ -6602,6 +8203,10 @@ function _finishMessageJumpScroll(generation){
   _lastMessageClientHeight=container.clientHeight;
   _messageJumpScrollOwner=null;
   _programmaticScroll=false;
+  // The jump no longer owns the viewport, so the measurement chain held during
+  // it can run (#7591). Guarded internally: if the reader is actively scrolling
+  // again the refresh is re-held for the scroll-settle timer instead.
+  if(typeof _resumeDeferredMessageVirtualMeasurement==='function') _resumeDeferredMessageVirtualMeasurement();
   if(typeof _syncScrollToBottomCue==='function'){
     _syncScrollToBottomCue(!_scrollPinned&&bottomDistance>80,{newMessage:_newMessageCueVisible});
   }
@@ -6630,6 +8235,9 @@ function _cancelMessageJumpScroll(){
   }
   _messageJumpScrollOwner=null;
   _programmaticScroll=false;
+  // A cancelled jump releases viewport ownership too, so a measurement refresh
+  // held for it must not be stranded (#7591).
+  if(typeof _resumeDeferredMessageVirtualMeasurement==='function') _resumeDeferredMessageVirtualMeasurement();
 }
 let _nearBottomCount=0;
 let _lastScrollTop=null;
@@ -9049,11 +10657,19 @@ function renderMd(raw){
       }
     }
     if(/^file:\/\//i.test(href)){
+      // #8033: same policy as the streaming converter (_smdLinkHref) and media refs (_inlineMediaHtmlForRef): only
+      // local authorities are served, a UNC 'file://server/share/...' link stays an inert file:// href, and the
+      // once-decoded pathname (with its '?…'/'#…' suffix) is forwarded with its leading separator.
       try{
-        const path=decodeURIComponent(href.replace(/^file:\/\//i,''));
+        const u=new URL(href);
+        if(u.hostname&&!/^(localhost|127\.0\.0\.1|\[::1\])$/i.test(u.hostname)) return href;
+        const path=decodeURIComponent((u.pathname||'')+((href.match(/[?#][\s\S]*$/)||[''])[0]));
         return 'api/media?path='+encodeURIComponent(path)+'&inline=1';
       }catch(_){
-        return 'api/media?path='+encodeURIComponent(href.replace(/^file:\/\//i,''))+'&inline=1';
+        // Fail closed: an unparseable URI with an authority may hide a non-local host.
+        if(/^file:\/\/[^/?#]+/i.test(href)) return href;
+        try{ return 'api/media?path='+encodeURIComponent(decodeURIComponent(href.replace(/^file:\/\//i,'')))+'&inline=1'; }
+        catch(__){ return 'api/media?path='+encodeURIComponent(href.replace(/^file:\/\//i,''))+'&inline=1'; }
       }
     }
     return href;
@@ -9307,8 +10923,18 @@ function lockComposerForClarify(placeholderText){
   if (sid && typeof _saveComposerDraftNow === 'function') {
     const saveText = String(input.value || '');
     const saveFiles = Array.isArray(S && S.pendingFiles) ? [...S.pendingFiles] : [];
+    // #7855: an unchanged restored goal continuation keeps its token in this save. Without it the
+    // payload stores goal_continuation_id '' and the continuation sent after a reload is no longer
+    // goal-related, which stops the goal loop. Edited text carries no token (round-7 rule).
+    const restoredCont = (typeof _peekRestoredGoalContinuationDraft === 'function')
+      ? _peekRestoredGoalContinuationDraft()
+      : null;
+    const saveContId = (restoredCont && restoredCont.id
+      && String(restoredCont.text || '').trim() === saveText.trim()) ? restoredCont.id : '';
     try {
-      const saveResult = _saveComposerDraftNow(sid, saveText, saveFiles);
+      const saveResult = saveContId
+        ? _saveComposerDraftNow(sid, saveText, saveFiles, saveContId)
+        : _saveComposerDraftNow(sid, saveText, saveFiles);
       if (saveResult && typeof saveResult.catch === 'function') {
         saveResult.catch((error)=>_handleComposerDraftPostFailure(error,sid,saveText,saveFiles));
       }
@@ -9530,7 +11156,11 @@ function setBusy(v){
         }
         autoResize();
         renderTray();
-        send();
+        // #7855 (round 5): pass the queued entry's continuation ID straight
+        // into THIS send() invocation. Round 4 published it to a shared module
+        // slot that any concurrent send could read, letting a genuine user
+        // turn consume the goal. An argument cannot leak across calls.
+        send({goalContinuationId:next.goal_continuation_id||''});
       },120);
     }
   }
@@ -9634,7 +11264,12 @@ function _renderQueueChips(sid){
         const liveQ=_getSessionQueue(sid,false);
         const first=snapshot.find(e=>e)||{};
         const firstFiles=(snapshot.find(e=>e&&Array.isArray(e.files)&&e.files.length)||{files:[]}).files;
-        liveQ.length=0;liveQ.push({text:combined,files:firstFiles,model:first.model||'',model_provider:first.model_provider||null,_queued_at:Date.now()});
+        // #7855: the combined entry keeps the FIRST continuation ID among the
+        // merged items. Combining a continuation with later user text still
+        // admits it (its ID is intact) — and a combine of pure user messages
+        // carries no ID, so it stays an ordinary turn.
+        const _contId=(snapshot.find(e=>e&&String(e.goal_continuation_id||'').trim())||{}).goal_continuation_id||'';
+        liveQ.length=0;liveQ.push({text:combined,files:firstFiles,model:first.model||'',model_provider:first.model_provider||null,goal_continuation_id:_contId,_queued_at:Date.now()});
         SESSION_QUEUES[sid]=liveQ;
         _persistSessionQueueStorage(sid,liveQ);
         delete _queueRenderKeys[sid];
@@ -9715,7 +11350,11 @@ function _renderQueueChips(sid){
         const liveQ=_getSessionQueue(sid,false);
         const idx=_entryTs!=null?liveQ.findIndex(e=>e&&e._queued_at===_entryTs):i;
         if(idx!==-1){
+          // #7855: keep the continuation ID when the user edits the text — the
+          // queue may rewrite the message, but the admission token stays with
+          // the entry (spread preserves it explicitly).
           liveQ[idx]={...liveQ[idx],text:newText};
+          if(liveQ[idx].goal_continuation_id==null) liveQ[idx].goal_continuation_id='';
           _persistSessionQueueStorage(sid,liveQ);
           delete _queueRenderKeys[sid];
           updateQueueBadge(sid);
@@ -9835,10 +11474,16 @@ function copyToastText(btn){
   _copyText(text).then(done).catch(()=>{});
 }
 function showToast(msg,ms,type){
+  // A type name in the duration slot (showToast(msg,'error') or showToast(msg,'info',6000)) is a type, not a
+  // duration: setTimeout(fn,'error') fires at once, so those toasts vanished as soon as they appeared.
+  if(typeof ms==='string'&&/^(error|success|warning|info)$/.test(ms)&&(type==null||typeof type==='number')){
+    const swapped=type;type=ms;ms=(typeof swapped==='number')?swapped:null;
+  }
   const el=$('toast');if(!el)return;
   const s=String(msg==null?'':msg);let t=type;
   if(!t){const low=s.toLowerCase();if(/fail|error|denied|invalid|unavailable|no active|no workspace match|no model match|no personalities/.test(low))t='error';else if(/warn|queued|takes effect|skipped|fallback/.test(low))t='warning';else if(/saved|created|imported|restored|switched|set to|updated|duplicated|moved to|renamed|deleted|complete|pinned|archived|cleared|stopped/.test(low))t='success';else t='info';}
-  const duration=(ms==null)?(t==='error'?TOAST_ERROR_DEFAULT_MS:TOAST_DEFAULT_MS):ms;
+  // 0 (the old "use default" sentinel) and other non-positive or non-numeric values mean the default, not "hide now".
+  const duration=(ms==null||!(Number(ms)>0))?(t==='error'?TOAST_ERROR_DEFAULT_MS:TOAST_DEFAULT_MS):ms;
   el.className='toast show '+t;
   el.dataset.toastMessage=s;
   if(t==='error') el.innerHTML=`<span class="toast-message">${esc(s)}</span><button class="toast-copy" type="button" data-toast-copy="1" onclick="copyToastText(this);event.stopPropagation()">Copy</button><button class="toast-dismiss" type="button" aria-label="Dismiss error toast" data-toast-dismiss="1" onclick="dismissToast(this);event.stopPropagation()">Dismiss</button>`;
@@ -11638,6 +13283,56 @@ function _liveTurnCarriesUnsettledContent(turn){
   ).length) return true;
   return turn.querySelectorAll('[data-live-assistant="1"]').length>1;
 }
+function _normalizeTransferredLiveProse(turn){
+  // #7676 (Transparent Stream): a transferred live turn can carry the final
+  // answer in a segment that is deliberately hidden while its scene rows render
+  // the activity — `assistant-segment-worklog-source` + aria-hidden + hidden.
+  // If that node lands as the pane's ONLY copy of the reply (scene rows already
+  // removed by the settle render), the settled reply renders blank. After the
+  // node is attached, un-hide the retained final prose as the fallback — unless
+  // another visible scene row actually owns the prose.
+  //
+  // Visibility here is STRUCTURAL (hidden/aria-hidden/display), not geometric:
+  // this runs before the node is attached, where getClientRects() is empty for
+  // everything.
+  if(!turn||!turn.querySelectorAll) return turn;
+  const _segs=turn.querySelectorAll('.assistant-segment.assistant-segment-worklog-source[data-live-assistant="1"]');
+  if(!_segs||!_segs.length) return turn;
+  const _structVisible=(el)=>!!(el
+    && !el.hidden
+    && el.getAttribute('aria-hidden')!=='true'
+    && !(el.style&&el.style.display==='none'));
+  const _rows=Array.prototype.slice.call(turn.querySelectorAll(
+    '[data-anchor-scene-row="1"],.transparent-event-row,.tool-worklog-group,.tool-card-row'
+  ));
+  // While a stream is still attached, the transparent live scene keeps the
+  // streaming prose hidden ON PURPOSE (the rows are the progress surface) — a
+  // mid-stream render must not start showing it early. A reconnecting pane has
+  // no attached stream (S.activeStreamId null) and may reveal.
+  const _streaming=(typeof S!=='undefined'&&S&&!!S.activeStreamId);
+  const _otherVisibleContent=(()=>{
+    for(const other of turn.querySelectorAll('.assistant-segment')){
+      if(Array.prototype.indexOf.call(_segs,other)!==-1) continue;
+      if(other.classList.contains('assistant-segment-worklog-source')) continue;
+      if(_structVisible(other)&&(other.textContent||'').trim()) return true;
+    }
+    return _rows.some(row=>_structVisible(row)&&(row.textContent||'').trim());
+  })();
+  Array.prototype.slice.call(_segs).forEach(seg=>{
+    const text=(seg.textContent||'').trim();
+    if(!text) return;
+    const tail=text.slice(-Math.min(40,text.length));
+    const _owned=_rows.some(row=>_structVisible(row)&&(row.textContent||'').indexOf(tail)!==-1);
+    if(_owned) return;             // another visible scene row already shows this prose
+    if(_streaming&&_otherVisibleContent) return;  // live scene still owns the frame
+    seg.classList.remove('assistant-segment-worklog-source');
+    seg.removeAttribute('aria-hidden');
+    seg.removeAttribute('hidden');
+    seg.hidden=false;
+    if(seg.style) seg.style.display='';
+  });
+  return turn;
+}
 function _settledTranscriptOwnsLiveTurn(sid, turn){
   if(!turn) return false;
   const msgs=(typeof S!=='undefined'&&S&&Array.isArray(S.messages))?S.messages:null;
@@ -13023,6 +14718,7 @@ function syncTopbar(){
     if(_profileLabel) _profileLabel.textContent=S.activeProfile||'default';
     const _titleLabel=$('titlebarProfileLabel');
     if(_titleLabel) _titleLabel.textContent=S.activeProfile||'default';
+    if(typeof _syncProviderQuotaForActiveContext==='function') _syncProviderQuotaForActiveContext();
     return;
   }
   const sessionTitle=S.session.title||t('untitled');
@@ -13150,6 +14846,7 @@ function syncTopbar(){
   if(profileLabel) profileLabel.textContent=S.activeProfile||'default';
   const titleLabel=$('titlebarProfileLabel');
   if(titleLabel) titleLabel.textContent=S.activeProfile||'default';
+  if(typeof _syncProviderQuotaForActiveContext==='function') _syncProviderQuotaForActiveContext();
 }
 
 function msgContent(m){
@@ -16822,6 +18519,67 @@ function _collapseJustSettledWorklogInPlace(streamId){
   }
   return true;
 }
+function _finalizeJustSettledTransparentScene(streamId){
+  // #7676 (Transparent Stream): the settled transparent scene is written by the
+  // FIRST settle render while the keep-open token is still armed, so it renders
+  // uncapped — and the compact path above cannot act on it (transparent activity
+  // rows are flat; there is no disclosure group to collapse). STREAM_DONE
+  // therefore used to fall through to a SECOND full render (`innerHTML=''`
+  // rebuild of the entire transcript) purely to reach the final state — the
+  // widest possible blank window, once per turn end.
+  //
+  // Finalize in place instead: re-render ONLY this turn's settled scene now that
+  // the token is disarmed (so the row cap and the retained-final-prose state are
+  // applied), never touching the rest of the transcript. Returns true only when
+  // that in-place finalize actually happened AND the turn is visibly non-blank;
+  // otherwise the caller must keep the full rebuild as the fallback.
+  if(!streamId) return false;
+  if(typeof isTransparentStream!=='function'||!isTransparentStream()) return false;
+  const inner=$('msgInner');
+  if(!inner||!Array.isArray(S.messages)) return false;
+  const msgs=S.messages;
+  let ownerIdx=-1;
+  for(let i=msgs.length-1;i>=0;i--){
+    const msg=msgs[i];
+    if(msg&&msg.role==='assistant'&&msg._anchor_activity_scene
+       &&typeof _settledAssistantStreamId==='function'
+       &&_settledAssistantStreamId(msg)===String(streamId)){
+      ownerIdx=i;break;
+    }
+  }
+  if(ownerIdx<0) return false;
+  const segment=inner.querySelector('.assistant-segment[data-msg-idx="'+ownerIdx+'"]');
+  if(!segment) return false;
+  const turn=typeof segment.closest==='function'?segment.closest('.assistant-turn'):null;
+  if(!turn) return false;
+  // The scene renderer replaces this turn's rows with the global default
+  // detail state; bracket it with the existing capture/restore pair (the same
+  // bracket renderMessages uses) so the reader's disclosure choices and detail
+  // body scroll survive the in-place finalize.
+  const detailDisclosureState=typeof _captureWorklogDetailDisclosureState==='function'
+    ? _captureWorklogDetailDisclosureState(turn)
+    : null;
+  const settledSceneRendered=_renderSettledAnchorSceneTransparentForMessage(msgs[ownerIdx],segment,ownerIdx);
+  if(typeof _restoreWorklogDetailDisclosureState==='function')
+    _restoreWorklogDetailDisclosureState(turn,detailDisclosureState);
+  if(!settledSceneRendered) return false;
+  const _visibleRows=turn.querySelectorAll('.transparent-event-row:not([hidden]):not([aria-hidden="true"])');
+  if(_assistantTurnHasVisibleRenderedSegment(turn)!==true&&!_visibleRows.length) return false;
+  // The skipped full render was also the pass that enhanced Markdown tables (sort buttons and filter, wired by
+  // the renderMessages wrapper in messages.js). The scene renderer replaced this turn's rows, so enhance them
+  // here; tables in retained activity rows otherwise lose sorting and filtering (#7833 re-gate).
+  if(typeof enhanceMarkdownTables==='function') enhanceMarkdownTables(turn);
+  // The skipped full render was also the one that (re)wrote _sessionHtmlCache:
+  // the first settle render is excluded while the keep-open token is armed, so
+  // drop any older entry for this session — a later switch must rebuild from
+  // S.messages instead of restoring pre-settle HTML.
+  if(typeof _sessionHtmlCache!=='undefined'&&_sessionHtmlCache
+     &&typeof _sessionHtmlCache.delete==='function'){
+    _sessionHtmlCache.delete(S.session&&S.session.session_id);
+    if(typeof _sessionHtmlCacheSid!=='undefined') _sessionHtmlCacheSid=null;
+  }
+  return true;
+}
 // True while a just-settled worklog is being force-rendered open (between
 // _armKeepSettledWorklogOpen and _disarmKeepSettledWorklogOpen). renderMessages()
 // consults this so it does NOT write the forced-open DOM into _sessionHtmlCache:
@@ -18068,9 +19826,9 @@ window._bindHermesExtensionMessageActions=function(){
 // constant-allocation cost: strings are streamed char-by-char (no copy) and
 // object fields are walked key-by-key so only scalar string forms are ever
 // allocated — no integral JSON.stringify() of a whole payload, and no
-// head/tail slice copies. _renderCacheKey's length+edges shortcut is only
-// safe for the render-window geometry key, where equal span+edges means
-// equal window; here equal signature must mean equal CONTENT.
+// head/tail slice copies. Equal signature must mean equal CONTENT (the
+// per-message _renderCacheKey hashes every character of long bodies for the
+// same reason).
 function _addBoundedHash(add, value, depth){
   if(value==null){ add('null'); return; }
   const t=typeof value;
@@ -19220,14 +20978,117 @@ function _scrollAfterMessageRender(preserveScroll, scrollSnapshot){
   scrollToBottom();
 }
 
-function _maybeRecoverVirtualizedBlankViewport(options, preserveScroll, virtualWindow){
+// #7591: blank-viewport recovery runs immediately after the render's OWN scroll
+// restore, and that restore re-arms _programmaticScroll with a fresh timestamp
+// (see _restoreMessageScrollSnapshot). So by the time recovery runs it can no
+// longer tell that write apart from an INDEPENDENT programmatic scroll that was
+// already settling — a depth counter read from inside recovery was therefore
+// always non-zero and the guard never consulted the latch at all. Capture the
+// ownership BEFORE the restore at the render call sites and pass it in, so the
+// render's own write can use the bounded clamp while a genuinely foreign write
+// stays protected. A jump-to-question also holds viewport ownership outright.
+function _captureMessageRecoveryOwnership(){
+  return {
+    programmatic:(typeof _freshProgrammaticScrollActive==='function')?_freshProgrammaticScrollActive():false,
+    jumpOwner:(typeof _messageJumpScrollOwner!=='undefined'&&!!_messageJumpScrollOwner),
+  };
+}
+function _maybeRecoverVirtualizedBlankViewport(options, preserveScroll, virtualWindow, ownership){
   if(!preserveScroll||!virtualWindow||!virtualWindow.virtualized||!!(options&&options._virtualFallback)) return false;
-  if(_messageViewportIntersectsRenderedRow()) return false;
+  if(_messageViewportIntersectsRenderedRow()){
+    _messageVirtualBlankClampAttempts=0;
+    return false;
+  }
   if(_sessionHtmlCacheSid&&S.session&&S.session.session_id===_sessionHtmlCacheSid){
     _sessionHtmlCache.delete(_sessionHtmlCacheSid);
   }
   _messageVirtualWindowKey='';
+  // #7591: the full-render fallback below re-mounts the WHOLE transcript, which
+  // collapses scrollHeight to its real height; the browser then clamps scrollTop
+  // into the tail, the window re-derives from the clamped position, and the next
+  // blank detection repeats it — the measured windowed<->full-render oscillation
+  // (29 flips / 90s) that reads as "scrolling is stuck". While rows exist, clamp
+  // the viewport to the nearest rendered edge and refresh the WINDOW instead:
+  // that never changes scrollHeight, so nothing fights the input direction. The
+  // full render stays as the bounded escalation when the clamp cannot help (no
+  // rows, an in-flight programmatic write, or a clamp that did not take).
+  if(_clampVirtualizedBlankViewportToRenderedEdge(ownership)){
+    renderMessages({preserveScroll:true});
+    return true;
+  }
   renderMessages({preserveScroll:true,_virtualFallback:true});
+  return true;
+}
+// One clamp per blank detection: the attempt counter is cleared as soon as a
+// render intersects a rendered row again (in _maybeRecoverVirtualizedBlankViewport),
+// so a healthy transcript never accumulates budget and a still-blank viewport
+// escalates to the full render after exactly one geometry clamp instead of recursing.
+function _clampVirtualizedBlankViewportToRenderedEdge(ownership){
+  if(_messageVirtualBlankClampAttempts>=1) return false;
+  // A programmatic scroll write that was ALREADY settling when this render
+  // started is independent of the render's own restore, and a jump-to-question
+  // deliberately owns the viewport while it settles — clamping would fight
+  // either one. `ownership` is captured before _scrollAfterMessageRender at the
+  // render call sites (see _captureMessageRecoveryOwnership), so the restore's
+  // own fresh latch is never mistaken for a foreign write. With no captured
+  // ownership (direct/helper call) fall back to the live latch.
+  if(ownership){
+    if(ownership.programmatic||ownership.jumpOwner) return false;
+  }else if(typeof _freshProgrammaticScrollActive==='function'&&_freshProgrammaticScrollActive()){
+    return false;
+  }
+  const container=(typeof $==='function')?$('messages'):null;
+  if(!container||!container.querySelectorAll) return false;
+  const rows=container.querySelectorAll('[data-msg-idx]');
+  if(!rows||!rows.length) return false;
+  const containerRect=container.getBoundingClientRect();
+  if(!containerRect) return false;
+  const scrollTop=Math.max(0,Number(container.scrollTop)||0);
+  const clientHeight=Math.max(0,Number(container.clientHeight)||0);
+  if(!(clientHeight>0)) return false;
+  const viewBottom=scrollTop+clientHeight;
+  // Nearest ROW edge, not the union block: the render window is head rows plus
+  // the retained tail with a bottomPad gap between them, so the viewport can sit
+  // inside that gap — a position that is neither above the union top nor below
+  // the union bottom, and which the single-block clamp above could never fix.
+  let bestDistance=Infinity;
+  let bestEdge=null;
+  for(const row of rows){
+    if(!row||typeof row.getBoundingClientRect!=='function') continue;
+    // #7591: assistant-segment-worklog-source / assistant-segment-anchor keep
+    // data-msg-idx but are display:none, so their rects are zero. Left in the
+    // comparison they look like nearby edges above the viewport and can beat the
+    // real rows, sending recovery toward an invisible row — it stays blank and
+    // escalates to the full render this clamp exists to avoid. Only rows that
+    // actually generated a client rect are candidates.
+    if(typeof row.getClientRects==='function'&&row.getClientRects().length===0) continue;
+    const rect=row.getBoundingClientRect();
+    if(!rect||!Number.isFinite(rect.top)||!Number.isFinite(rect.bottom)) continue;
+    // Rows are measured in viewport space; lift them into document space.
+    const rowTop=rect.top-containerRect.top+scrollTop;
+    const rowBottom=rect.bottom-containerRect.top+scrollTop;
+    let distance=null;
+    let edge=null;
+    if(rowBottom<=scrollTop){ distance=scrollTop-rowBottom; edge=rowBottom; }
+    else if(rowTop>=viewBottom){ distance=rowTop-viewBottom; edge=rowTop; }
+    else continue; // straddles the viewport: not a blank-region edge
+    if(distance<bestDistance){ bestDistance=distance; bestEdge=edge; }
+  }
+  if(bestEdge===null) return false;
+  // Put the nearest edge at the middle of the viewport so the closest rendered
+  // row is unambiguously on screen after the clamp.
+  const maxScroll=Math.max(0,(Number(container.scrollHeight)||viewBottom)-clientHeight);
+  const next=Math.max(0,Math.min(maxScroll,Math.round(bestEdge-clientHeight*0.5)));
+  if(Math.abs(next-scrollTop)<2) return false;
+  _messageVirtualBlankClampAttempts++;
+  _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
+  container.scrollTop=next;
+  _lastScrollTop=container.scrollTop;
+  // #7591: tell the enclosing _compensateScrollForMeasurementDelta that this
+  // render moved scrollTop deliberately, so it skips its old-anchor
+  // compensation instead of writing scrollTopBefore+delta over the recovery.
+  _blankViewportRecoveryApplied=++_blankViewportRecoveryToken;
+  if(typeof _deferClearProgrammaticScroll==='function') _deferClearProgrammaticScroll();
   return true;
 }
 
@@ -19388,8 +21249,10 @@ function renderMessages(options){
       if(typeof addCopyButtons==='function') addCopyButtons(inner);
       if(typeof initTreeViews==='function') initTreeViews(inner);
       }catch(_){ /* fail-safe: a bad block (e.g. _buildTreeDOM overflow) must not abort scroll restore, cache or the caller; the deferred pass keeps the old contained failure */ }
+      // #7591: capture ownership before the restore re-arms the latch.
+      const recoveryOwnership=_captureMessageRecoveryOwnership();
       _scrollAfterMessageRender(preserveScroll, scrollSnapshot);
-      if(_maybeRecoverVirtualizedBlankViewport(options, preserveScroll, virtualWindow)) return;
+      if(_maybeRecoverVirtualizedBlankViewport(options, preserveScroll, virtualWindow, recoveryOwnership)) return;
       _updateMessageVirtualMeasurements(renderVisWithIdx, renderVisibleIdxs, virtualWindow);
       requestAnimationFrame(()=>_postProcessWithAnchorSuppression(inner));
       if(typeof _initMediaPlaybackObserver==='function') _initMediaPlaybackObserver();
@@ -19431,7 +21294,18 @@ function renderMessages(options){
       const _hasLiveAssistantProjection=Array.isArray(S.messages)&&S.messages.some(m=>
         m&&m.role==='assistant'&&(m._live||m._activityBurstId!==undefined||m._liveSegmentSeq!==undefined)
       );
-      if(S.activeStreamId || _hasLiveAssistantProjection){
+      // #7676: TERMINAL SETTLEMENT OWNS THE TURN. The live-projection branch
+      // above exists for the reconnect case — the pane is still working
+      // (S.busy) when the SSE transport drops and the journal snapshot carries
+      // live markers. It must NOT apply once the pane has settled: after
+      // `done`/`cancel` the projection is the authority, and re-attaching the
+      // parser-owned node over it can re-pin the pre-settle live DOM — which
+      // in Transparent Stream carries the final prose hidden
+      // (`assistant-segment-worklog-source` + aria-hidden + hidden) with its
+      // scene rows already removed, i.e. the reported blank (#7676). A settled
+      // pane (idle, no live stream ownership) therefore never preserves.
+      const _paneSettled=S.busy===false && !S.activeStreamId;
+      if(S.activeStreamId || (_hasLiveAssistantProjection && !_paneSettled)){
         _preservedLiveTurn=_lt;
       }
     }
@@ -20895,83 +22769,6 @@ function renderMessages(options){
       }
     }
   }
-  // Fail-safe invariant (#3875): a settled assistant turn must never render with
-  // ZERO visible content. The Worklog redesign (#3401) folds intermediate
-  // assistant segments into a collapsed Worklog card and hides the source segment
-  // (`assistant-segment-worklog-source` → display:none). That is correct WHEN the
-  // turn also has a visible final answer. But when a turn's ONLY content is folded
-  // into a collapsed Worklog (e.g. an autonomous/interrupted run whose final
-  // assistant message is empty, or a reload where S.toolCalls didn't hydrate so the
-  // worklog card built with no expandable tool steps), every segment is hidden and
-  // the turn paints as nothing — leaving the transcript a bare stack of date
-  // separators (#3875 brick). Reveal such turns so their content is never silently
-  // swallowed: expand the turn's Worklog group(s) when the turn has no other
-  // visible content. This NEVER touches a turn that has any visible segment, so the
-  // intended collapsed-Worklog UX is preserved whenever a visible answer exists.
-  // The live turn is excluded by its `liveAssistantTurn` id (it drives its own
-  // state during a stream), so this sweep is safe to run even while busy — a
-  // historical blank turn must not re-paint blank during a follow-up stream
-  // (Opus advisor, stage-342).
-  {
-    const _turnHasVisibleContent=(turn)=>{
-      if(typeof _assistantTurnHasVisibleRenderedSegment==='function'){
-        return _assistantTurnHasVisibleRenderedSegment(turn)===true;
-      }
-      // Keep the extracted renderMessages test harness self-contained.
-      if(!turn||typeof turn.querySelectorAll!=='function') return false;
-      for(const seg of turn.querySelectorAll('.assistant-segment')){
-        if(seg.classList.contains('assistant-segment-worklog-source')) continue;
-        if(seg.classList.contains('assistant-segment-anchor')) continue;
-        if((seg.textContent||'').trim()) return true;
-      }
-      return false;
-    };
-    for(const turn of inner.querySelectorAll('.assistant-turn')){
-      if(turn.id==='liveAssistantTurn') continue; // live turn drives its own state
-      if(_turnHasVisibleContent(turn)) continue;
-      // No visible content — surface the folded Worklog so the turn isn't blank.
-      const groups=turn.querySelectorAll('.tool-worklog-group,.tool-call-group');
-      let revealed=false;
-      for(const group of groups){
-        // A settled Worklog whose rows are still deferred (#5839) has an empty
-        // textContent but is not empty in substance. Judging it empty here drops
-        // through to the last-resort un-hide below, and the deferred rows then
-        // materialize the same prose beside the segments it just un-hid.
-        // Materialize first, then judge.
-        if(group.getAttribute&&group.getAttribute('data-worklog-rows-deferred')==='1'
-           &&typeof _materializeDeferredWorklogRows==='function'){
-          _materializeDeferredWorklogRows(group);
-        }
-        if(!(group.textContent||'').trim()) continue; // empty group can't help
-        if(group.classList.contains('tool-call-group-collapsed')){
-          group.classList.remove('tool-call-group-collapsed');
-          group.classList.add('open');
-          const summary=group.querySelector('.tool-call-group-summary,.activity-summary');
-          if(summary) summary.setAttribute('aria-expanded','true');
-          // #5839: this turn is otherwise blank, so materialize any deferred
-          // settled rows now that we're force-expanding the worklog to fill it.
-          if(typeof _materializeDeferredWorklogRows==='function') _materializeDeferredWorklogRows(group);
-        }
-        // `revealed` means "this turn has a non-empty Worklog group that the user
-        // can see" — NOT "we just expanded something". An already-open non-empty
-        // group is itself visible (it slips past _turnHasVisibleContent only
-        // because that check inspects .assistant-segment nodes, not group bodies),
-        // so the turn isn't truly blank and the last-resort un-hide below is
-        // unnecessary. Keep this assignment OUTSIDE the if(collapsed) branch.
-        revealed=true;
-      }
-      // Last resort: no usable worklog group either, but hidden worklog-source
-      // segments carry the real text — un-hide them so nothing is lost.
-      if(!revealed){
-        for(const seg of turn.querySelectorAll('.assistant-segment-worklog-source')){
-          if(!(seg.textContent||'').trim()) continue;
-          seg.classList.remove('assistant-segment-worklog-source');
-          seg.removeAttribute('aria-hidden');
-          seg.hidden=false;
-        }
-      }
-    }
-  }
   // Re-attach the preserved live turn (#3877). The rebuild above recreated a
   // live turn from S.messages, but the live assistant message's content lags the
   // stream (it is only persisted to S.messages on a throttled write-back) — so the
@@ -21000,6 +22797,14 @@ function renderMessages(options){
   // no live segment to swap into. No-op for a settled turn or when nothing was
   // streaming.
   if(_preservedLiveTurn){
+    // #7676: the transferred node may hold the final answer in a segment that
+    // the transparent live scene hides (`assistant-segment-worklog-source` +
+    // aria-hidden + hidden) while its scene rows rendered the activity. If this
+    // node is about to become the pane's only copy of the reply (rows already
+    // removed by the settle render), the reply would go blank — so normalize the
+    // retained prose FIRST (it un-hides only when no visible scene row owns it),
+    // before any branch re-attaches the node.
+    _normalizeTransferredLiveProse(_preservedLiveTurn);
     const _rebuilt=document.getElementById('liveAssistantTurn');
     // Pick the PARSER-OWNED live segment, not just the first one. On reconnect /
     // post-tool activity boundaries a live turn can carry MULTIPLE
@@ -21077,6 +22882,90 @@ function renderMessages(options){
       }
     }
   }
+  // Fail-safe invariant (#3875): a settled assistant turn must never render with
+  // ZERO visible content. The Worklog redesign (#3401) folds intermediate
+  // assistant segments into a collapsed Worklog card and hides the source segment
+  // (`assistant-segment-worklog-source` → display:none). That is correct WHEN the
+  // turn also has a visible final answer. But when a turn's ONLY content is folded
+  // into a collapsed Worklog (e.g. an autonomous/interrupted run whose final
+  // assistant message is empty, or a reload where S.toolCalls didn't hydrate so the
+  // worklog card built with no expandable tool steps), every segment is hidden and
+  // the turn paints as nothing — leaving the transcript a bare stack of date
+  // separators (#3875 brick). Reveal such turns so their content is never silently
+  // swallowed: expand the turn's Worklog group(s) when the turn has no other
+  // visible content. This NEVER touches a turn that has any visible segment, so the
+  // intended collapsed-Worklog UX is preserved whenever a visible answer exists.
+  // The live turn is excluded by its `liveAssistantTurn` id while a stream
+  // still owns it (it drives its own state during a stream), so this sweep is
+  // safe to run even while busy — a historical blank turn must not re-paint
+  // blank during a follow-up stream (Opus advisor, stage-342). A SETTLED live
+  // turn is covered (#7676): the invariant runs after every preservation and
+  // swap decision above, so a transferred blank live node is revealed rather
+  // than pinned as the pane's zero-visible-content reply.
+  {
+    const _turnHasVisibleContent=(turn)=>{
+      if(typeof _assistantTurnHasVisibleRenderedSegment==='function'){
+        return _assistantTurnHasVisibleRenderedSegment(turn)===true;
+      }
+      // Keep the extracted renderMessages test harness self-contained.
+      if(!turn||typeof turn.querySelectorAll!=='function') return false;
+      for(const seg of turn.querySelectorAll('.assistant-segment')){
+        if(seg.classList.contains('assistant-segment-worklog-source')) continue;
+        if(seg.classList.contains('assistant-segment-anchor')) continue;
+        if((seg.textContent||'').trim()) return true;
+      }
+      return false;
+    };
+    const _liveTurnSettled=(S.busy===false && !S.activeStreamId); // #7676
+    for(const turn of inner.querySelectorAll('.assistant-turn')){
+      // #7676: the invariant must hold for a SETTLED live turn too — the
+      // transparent settle can transfer a node whose only copy of the reply is
+      // hidden. An ACTIVE stream still owns its node and drives its own state.
+      if(turn.id==='liveAssistantTurn'&&!_liveTurnSettled) continue;
+      if(_turnHasVisibleContent(turn)) continue;
+      // No visible content — surface the folded Worklog so the turn isn't blank.
+      const groups=turn.querySelectorAll('.tool-worklog-group,.tool-call-group');
+      let revealed=false;
+      for(const group of groups){
+        // A settled Worklog whose rows are still deferred (#5839) has an empty
+        // textContent but is not empty in substance. Judging it empty here drops
+        // through to the last-resort un-hide below, and the deferred rows then
+        // materialize the same prose beside the segments it just un-hid.
+        // Materialize first, then judge.
+        if(group.getAttribute&&group.getAttribute('data-worklog-rows-deferred')==='1'
+           &&typeof _materializeDeferredWorklogRows==='function'){
+          _materializeDeferredWorklogRows(group);
+        }
+        if(!(group.textContent||'').trim()) continue; // empty group can't help
+        if(group.classList.contains('tool-call-group-collapsed')){
+          group.classList.remove('tool-call-group-collapsed');
+          group.classList.add('open');
+          const summary=group.querySelector('.tool-call-group-summary,.activity-summary');
+          if(summary) summary.setAttribute('aria-expanded','true');
+          // #5839: this turn is otherwise blank, so materialize any deferred
+          // settled rows now that we're force-expanding the worklog to fill it.
+          if(typeof _materializeDeferredWorklogRows==='function') _materializeDeferredWorklogRows(group);
+        }
+        // `revealed` means "this turn has a non-empty Worklog group that the user
+        // can see" — NOT "we just expanded something". An already-open non-empty
+        // group is itself visible (it slips past _turnHasVisibleContent only
+        // because that check inspects .assistant-segment nodes, not group bodies),
+        // so the turn isn't truly blank and the last-resort un-hide below is
+        // unnecessary. Keep this assignment OUTSIDE the if(collapsed) branch.
+        revealed=true;
+      }
+      // Last resort: no usable worklog group either, but hidden worklog-source
+      // segments carry the real text — un-hide them so nothing is lost.
+      if(!revealed){
+        for(const seg of turn.querySelectorAll('.assistant-segment-worklog-source')){
+          if(!(seg.textContent||'').trim()) continue;
+          seg.classList.remove('assistant-segment-worklog-source');
+          seg.removeAttribute('aria-hidden');
+          seg.hidden=false;
+        }
+      }
+    }
+  }
   // Only force-scroll when not actively streaming — mid-stream re-renders
   // (tool completion, session switch) must not override the user's scroll position.
   // scrollIfPinned() respects _scrollPinned, so it's a no-op if user scrolled up.
@@ -21096,8 +22985,12 @@ function renderMessages(options){
   if(typeof addCopyButtons==='function') addCopyButtons(inner);
   if(typeof initTreeViews==='function') initTreeViews(inner);
   }catch(_){ /* fail-safe: a bad block (e.g. _buildTreeDOM overflow) must not abort scroll restore, cache or the caller; the deferred pass keeps the old contained failure */ }
+  // #7591: capture viewport ownership BEFORE the restore (see the sibling
+  // cache-branch call site) so recovery can tell an independent in-flight
+  // programmatic write from this render's own.
+  const recoveryOwnership=_captureMessageRecoveryOwnership();
   _scrollAfterMessageRender(preserveScroll, scrollSnapshot);
-  if(_maybeRecoverVirtualizedBlankViewport(options, preserveScroll, virtualWindow)) return;
+  if(_maybeRecoverVirtualizedBlankViewport(options, preserveScroll, virtualWindow, recoveryOwnership)) return;
   // Apply syntax highlighting after DOM is built
   requestAnimationFrame(()=>_postProcessWithAnchorSuppression(inner));
   // Refresh todo panel if it's currently open
@@ -22571,13 +24464,24 @@ function _buildTreeDOM(val, depth){
   return el;
 }
 
+// #2168 (session-switch latency): every other helper called by
+// postProcessRenderedMessages carries a selector-level idempotence marker so a
+// repeat pass matches zero nodes and returns early. This one alone re-walked
+// every code block in the transcript and then ran a nested querySelector() per
+// block to filter out ones that already had a button — on a cached-transcript
+// switch that is O(code blocks) node visits to add nothing. The data-copy-btn
+// marker makes the repeat pass match nothing; the nested guard stays as the
+// correctness backstop for header-placed buttons (see #1096).
 function addCopyButtons(container){
   const el=container||$('msgInner');
   if(!el) return;
-  el.querySelectorAll('pre > code').forEach(codeEl=>{
+  el.querySelectorAll('pre > code:not([data-copy-btn])').forEach(codeEl=>{
     const pre=codeEl.parentElement;
     const header=pre.previousElementSibling;
-    if(pre.querySelector('.code-copy-btn')||(header&&header.classList.contains('pre-header')&&header.querySelector('.code-copy-btn'))) return;
+    if(pre.querySelector('.code-copy-btn')||(header&&header.classList.contains('pre-header')&&header.querySelector('.code-copy-btn'))){
+      codeEl.dataset.copyBtn='1';  // already has one; mark so the selector stops re-matching it
+      return;
+    }
     const btn=document.createElement('button');
     btn.className='code-copy-btn';
     btn.textContent=t('copy');
@@ -22598,11 +24502,33 @@ function addCopyButtons(container){
       btn.style.cssText='position:absolute;top:6px;right:6px;';
       pre.appendChild(btn);
     }
+    // Marked after BOTH placements so a block whose button was appended to the
+    // sibling .pre-header is skipped by the selector on the next pass too.
+    codeEl.dataset.copyBtn='1';
   });
 }
 
 let _mermaidLoading=false;
 let _mermaidReady=false;
+
+function _mediaPreviewErrorKey(error,fallbackKey){
+  const status=Number(error&&error.status);
+  if(status===401) return 'media_preview_unauthorized';
+  if(status===403) return 'media_preview_forbidden';
+  if(status===404) return 'media_preview_not_found';
+  return fallbackKey;
+}
+
+function _mediaPreviewAllowsDownload(errorKey){
+  return errorKey!=='media_preview_unauthorized'&&errorKey!=='media_preview_forbidden'&&errorKey!=='media_preview_not_found';
+}
+
+function _requireMediaResponse(response){
+  if(response.ok) return response;
+  const error=new Error(String(response.status));
+  error.status=response.status;
+  throw error;
+}
 
 function loadDiffInline(container){
   const DIFF_MAX_SIZE=512*1024; // 512 KB cap for inline diff rendering
@@ -22612,7 +24538,7 @@ function loadDiffInline(container){
     const path=el.dataset.path;
     const snap=_mediaSnapQuery(el).replace(/^&snap=/,'');
     fetch(_mediaPreviewUrl(path,{snap:snap||undefined}))
-      .then(r=>{if(!r.ok) throw new Error(r.status);return r.text();})
+      .then(r=>_requireMediaResponse(r).text())
       .then(text=>{
         if(text.length>DIFF_MAX_SIZE){
           el.outerHTML=`<div class="diff-inline-error">${esc(path.split('/').pop())}<br><span style="color:var(--muted);font-size:12px">${t('diff_too_large')}</span></div>`;
@@ -22627,8 +24553,8 @@ function loadDiffInline(container){
         }).join('\n');
         el.outerHTML=`<div class="diff-inline"><div class="pre-header">${esc(path.split('/').pop())}</div><pre class="diff-block"><code>${lines}</code></pre></div>`;
       })
-      .catch(()=>{
-        el.outerHTML=`<div class="diff-inline-error">${esc(path.split('/').pop())}<br><span style="color:var(--muted);font-size:12px">${t('diff_error')}</span></div>`;
+      .catch(error=>{
+        el.outerHTML=`<div class="diff-inline-error">${esc(path.split('/').pop())}<br><span style="color:var(--muted);font-size:12px">${t(_mediaPreviewErrorKey(error,'diff_error'))}</span></div>`;
       });
   });
 }
@@ -22687,7 +24613,10 @@ function buildCsvTablePreview(path, text, downloadUrl=''){
 
 function _csvPreviewErrorHtml(path, errorKey, downloadUrl=_csvMediaUrl(path,{download:true})){
   const fname=path.split('/').pop()||path;
-  return `<div class="diff-inline-error">${esc(fname)}<br><a class="msg-media-link" href="${esc(downloadUrl)}" download="${esc(fname)}">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t(errorKey)}</span></div>`;
+  const downloadHtml=_mediaPreviewAllowsDownload(errorKey)
+    ? `<br><a class="msg-media-link" href="${esc(downloadUrl)}" download="${esc(fname)}">📎 ${esc(fname)}</a>`
+    : '';
+  return `<div class="diff-inline-error">${esc(fname)}${downloadHtml}<br><span style="color:var(--muted);font-size:12px">${t(errorKey)}</span></div>`;
 }
 
 function loadCsvInline(container){
@@ -22699,13 +24628,13 @@ function loadCsvInline(container){
     const mediaUrl=_csvMediaUrl(path,{snap:snap||undefined});
     const downloadUrl=_csvMediaUrl(path,{download:true,snap:snap||undefined});
     fetch(mediaUrl)
-      .then(r=>{if(!r.ok) throw new Error(r.status);return r.text();})
+      .then(r=>_requireMediaResponse(r).text())
       .then(text=>{
         const preview=buildCsvTablePreview(path, text, downloadUrl);
         el.outerHTML=preview.html||_csvPreviewErrorHtml(path, preview.errorKey||'csv_error', downloadUrl);
       })
-      .catch(()=>{
-        el.outerHTML=_csvPreviewErrorHtml(path, 'csv_error', downloadUrl);
+      .catch(error=>{
+        el.outerHTML=_csvPreviewErrorHtml(path, _mediaPreviewErrorKey(error,'csv_error'), downloadUrl);
       });
   });
 }
@@ -22719,7 +24648,7 @@ function loadExcalidrawInline(container){
     const snap=_mediaSnapQuery(el).replace(/^&snap=/,'');
     const downloadUrl=_mediaPreviewUrl(path,{download:true,snap:snap||undefined});
     fetch(_mediaPreviewUrl(path,{snap:snap||undefined}))
-      .then(r=>{if(!r.ok) throw new Error(r.status);return r.text();})
+      .then(r=>_requireMediaResponse(r).text())
       .then(text=>{
         if(text.length>EXCALIDRAW_MAX_SIZE){
           el.outerHTML=`<div class="diff-inline-error">${esc(path.split('/').pop())}<br><span style="color:var(--muted);font-size:12px">${t('excalidraw_too_large')}</span></div>`;
@@ -22746,8 +24675,8 @@ function loadExcalidrawInline(container){
         // Lazy-init Excalidraw render after DOM insertion
         requestAnimationFrame(()=>_renderExcalidrawCanvases());
       })
-      .catch(()=>{
-        el.outerHTML=`<div class="diff-inline-error">${esc(path.split('/').pop())}<br><span style="color:var(--muted);font-size:12px">${t('excalidraw_error')}</span></div>`;
+      .catch(error=>{
+        el.outerHTML=`<div class="diff-inline-error">${esc(path.split('/').pop())}<br><span style="color:var(--muted);font-size:12px">${t(_mediaPreviewErrorKey(error,'excalidraw_error'))}</span></div>`;
       });
   });
 }
@@ -22851,7 +24780,7 @@ function loadPdfInline(container){
     const dlUrl=_mediaPreviewUrl(path,{download:true,snap:snap||undefined});
     const loadPdf=(pdfjsLib)=>{
       fetch(mediaUrl)
-        .then(r=>{if(!r.ok) throw new Error(r.status); return r.arrayBuffer();})
+        .then(r=>_requireMediaResponse(r).arrayBuffer())
         .then(buf=>{
           if(buf.byteLength>PDF_MAX_SIZE){
             el.outerHTML=`<div class="pdf-preview-fallback"><a class="msg-media-link" href="${dlUrl}" download="${esc(fname)}">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t('pdf_too_large')}</span></div>`;
@@ -22898,8 +24827,13 @@ function loadPdfInline(container){
           };
           renderPage(1);
         })
-        .catch(()=>{
-          el.outerHTML=`<div class="pdf-preview-fallback"><a class="msg-media-link" href="${dlUrl}" download="${esc(fname)}">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t('pdf_error')}</span></div>`;
+        .catch(error=>{
+          const errorKey=_mediaPreviewErrorKey(error,'pdf_error');
+          const fileHtml=_mediaPreviewAllowsDownload(errorKey)
+            ? `<a class="msg-media-link" href="${dlUrl}" download="${esc(fname)}">📎 ${esc(fname)}</a>`
+            : esc(fname);
+          const errorClass=_mediaPreviewAllowsDownload(errorKey)?'pdf-preview-fallback':'diff-inline-error';
+          el.outerHTML=`<div class="${errorClass}">${fileHtml}<br><span style="color:var(--muted);font-size:12px">${t(errorKey)}</span></div>`;
         });
     };
     if(_pdfjsReady){
@@ -22942,7 +24876,7 @@ function loadHtmlInline(container){
     const openUrl=_mediaPreviewUrl(path,{inline:true,snap:snap||undefined});
     const dlUrl=_mediaPreviewUrl(path,{download:true,snap:snap||undefined});
     fetch(mediaUrl, {cache:'no-store'})
-      .then(r=>{if(!r.ok) throw new Error(r.status); return r.text();})
+      .then(r=>_requireMediaResponse(r).text())
       .then(html=>{
         if(html.length>HTML_MAX_SIZE){
           el.outerHTML=`<div class="html-preview-fallback"><a class="msg-media-link" href="${openUrl}" target="_blank" rel="noopener">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t('html_too_large')}</span></div>`;
@@ -22951,8 +24885,13 @@ function loadHtmlInline(container){
         const safeHtml=html.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
         el.outerHTML=`<div class="html-preview-wrap"><div class="html-preview-header"><span>${t('html_sandbox_label')}</span><a href="${openUrl}" target="_blank" rel="noopener" class="html-open-link">${t('html_open_full')} ↗</a></div><iframe srcdoc="${safeHtml}" sandbox="allow-scripts" class="html-preview-iframe" loading="lazy"></iframe></div>`;
       })
-      .catch(()=>{
-        el.outerHTML=`<div class="html-preview-fallback"><a class="msg-media-link" href="${dlUrl}" download="${esc(fname)}">📎 ${esc(fname)}</a><br><span style="color:var(--muted);font-size:12px">${t('html_error')}</span></div>`;
+      .catch(error=>{
+        const errorKey=_mediaPreviewErrorKey(error,'html_error');
+        const fileHtml=_mediaPreviewAllowsDownload(errorKey)
+          ? `<a class="msg-media-link" href="${dlUrl}" download="${esc(fname)}">📎 ${esc(fname)}</a>`
+          : esc(fname);
+        const errorClass=_mediaPreviewAllowsDownload(errorKey)?'html-preview-fallback':'diff-inline-error';
+        el.outerHTML=`<div class="${errorClass}">${fileHtml}<br><span style="color:var(--muted);font-size:12px">${t(errorKey)}</span></div>`;
       });
   });
 }

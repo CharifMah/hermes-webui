@@ -38,6 +38,36 @@ class TestGeneratedTitleSanitization(unittest.TestCase):
             '',
         )
 
+    def test_rejects_prompt_instruction_echo_title_should_be_in_french(self):
+        # glm-5.3-flash sometimes returns the prompt instruction itself
+        # instead of the generated title (screenshot bug 2026-10).
+        self.assertEqual(
+            _sanitize_generated_title(
+                'Title should be in French, 3-8 words, topic label, not a full s…'
+            ),
+            '',
+        )
+
+    def test_rejects_prompt_instruction_echo_something_like(self):
+        self.assertEqual(
+            _sanitize_generated_title(
+                'Something like "Fix tests E2E Playwright local" or in French…'
+            ),
+            '',
+        )
+
+    def test_rejects_prompt_instruction_echo_french_variants(self):
+        for raw in (
+            'A good title in French: "Merge branche editor play menu"',
+            'Title in French, 3-8 words, topic label style',
+            'Titre en français, 3-8 mots, style étiquette de sujet',
+        ):
+            with self.subTest(raw=raw):
+                self.assertNotEqual(
+                    _sanitize_generated_title(raw),
+                    raw,
+                )
+
     def test_unresolved_title_uses_latest_completed_exchange_after_warmup(self):
         messages = [
             {"role": "user", "content": "Hello world, now you're on GLM 5.3 buddy."},
